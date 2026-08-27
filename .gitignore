@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# The vault holds encrypted PII and wrapped keys. Never commit it.
+*.db
+*.db-journal
+
+# Pipeline output
+scrubbed.zip
+restored.zip
+
+# Generated demo inputs and local key material
+samples/
+.env.local
+
+# Local tool settings
+.claude/settings.local.json
