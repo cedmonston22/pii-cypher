@@ -16,7 +16,6 @@ from typing import Any
 
 from core import vault
 from core.crypto import aad, decrypt, encrypt, token_hash
-from core.detect import audit
 from core.extract import NoTextLayer, extract_lines, page_count
 from core.fieldmap import (
     AnchorMismatch,
@@ -31,6 +30,7 @@ from core.fieldmap import (
 from core.keys import generate_data_key, unwrap, wrap
 from core.redact import ReplacementTooSmall, redact, restore_pdf
 from core.tokens import assign, find_tokens
+from detect import Report, detect
 from core.verify import (
     PlaintextSurvived,
     TokenNotWritten,
@@ -99,6 +99,10 @@ class ScrubbedDoc:
     # PII-shaped text the field map did not claim. Non-blocking: the document is
     # still delivered, but a stale map surfaces here instead of failing silently.
     warnings: list[str] = dataclass_field(default_factory=list)
+    # The candidates behind those warnings, with their evidence, for a review
+    # screen. Not persisted: candidates carry values and documents.reason is
+    # plaintext.
+    candidates: tuple = ()
 
 
 @dataclass
@@ -209,7 +213,7 @@ def scrub_one(
     encrypted: set[str],
     policy: dict[str, Any],
     field_maps: list[dict[str, Any]],
-) -> tuple[bytes, str, list[Field], list[vault.Entry], list[str]]:
+) -> tuple[bytes, str, list[Field], list[vault.Entry], list[str], Report]:
     """Scrub one document. Raises rather than returning a partial result.
 
     Returns the scrubbed PDF, the form id, the fields replaced, vault entries for
@@ -225,10 +229,12 @@ def scrub_one(
     verify_labels(pages, field_map)
     located = propagate(pages, locate(pages, field_map))
 
-    # Audit against everything located, before the policy filter: comparing
-    # against the post-filter set would report a deliberate policy exclusion as
-    # a coverage gap.
-    warnings = [str(w) for w in audit(pages, {f["value"] for f in located})]
+    # Detection runs beside location, never instead of it: nothing it finds is
+    # redacted, and locate() alone decides what gets replaced. It runs against
+    # everything located, before the policy filter, because comparing against
+    # the post-filter set would report a deliberate policy exclusion as a gap.
+    report = detect(pages, field_map=field_map, located=located, policy=policy)
+    warnings = report.warnings
 
     fields = _in_policy(located, policy)
 
@@ -253,7 +259,7 @@ def scrub_one(
     verify_scrubbed(scrubbed, values)
     verify_tokens_present(scrubbed, {token_map[v] for v in values})
 
-    return scrubbed, field_map["form_id"], fields, entries, warnings
+    return scrubbed, field_map["form_id"], fields, entries, warnings, report
 
 
 def scrub_batch(
@@ -277,7 +283,7 @@ def scrub_batch(
 
     for filename, pdf_bytes in files:
         try:
-            scrubbed, form_id, fields, entries, warnings = scrub_one(
+            scrubbed, form_id, fields, entries, warnings, report = scrub_one(
                 pdf_bytes, job_id, job_key, token_map, encrypted, policy, field_maps
             )
         except QUARANTINE_ERRORS as exc:
@@ -307,6 +313,7 @@ def scrub_batch(
                 replaced_count=len(fields),
                 pdf_bytes=scrubbed,
                 warnings=warnings,
+                candidates=report.unclaimed,
             )
         )
 

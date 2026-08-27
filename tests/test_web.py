@@ -176,3 +176,32 @@ def test_job_detail_decrypts_filenames_for_display(client, k1_bytes):
     job_id = _job_id_from(client.post("/scrub", files=[_upload("Smith_John_K1.pdf", k1_bytes)]).text)
     page = client.get(f"/restore?job_id={job_id}")
     assert "Smith_John_K1.pdf" in page.text
+
+
+def test_the_review_screen_shows_why_a_value_was_flagged(client, k1_2025_bytes, monkeypatch):
+    """Evidence is not decoration -- it is what makes a warning actionable.
+
+    A bare "this looks like PII" gives a reviewer nothing to judge. Naming the
+    signals that agreed lets them tell a genuine map gap from a coincidence.
+    """
+    import copy
+
+    from core import fieldmap
+
+    original = fieldmap.load_field_maps
+
+    def stale(*args, **kwargs):
+        maps = copy.deepcopy(original(*args, **kwargs))
+        maps[0]["fields"] = [f for f in maps[0]["fields"] if f["name"] != "partner_tin"]
+        return maps
+
+    monkeypatch.setattr("core.pipeline.load_field_maps", stale)
+
+    response = client.post("/scrub", files=[_upload("k1.pdf", k1_2025_bytes)])
+    html = response.text
+
+    assert "Possible missed values" in html
+    assert "512-44-8890" in html, "the value itself is shown, for review"
+    assert "SSN" in html
+    assert "validator:SSN" in html, "the evidence must reach the screen"
+    assert "high" in html

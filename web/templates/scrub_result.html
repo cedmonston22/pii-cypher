@@ -26,9 +26,28 @@
   <p>These look like PII but are not described by the field map for this form.
      They were <strong>not</strong> replaced. This usually means the form has a
      field the map does not yet cover.</p>
+  <p class="hint">Confidence is measured, not asserted. <em>High</em> means several
+     independent signals agreed &mdash; the shape matched, a checksum or issuing-range
+     rule passed, and a nearby label named the same type. <em>Low</em> is usually one
+     signal alone, or a value whose shape is right but whose checksum is not.</p>
   {% for doc in flagged %}
   <p><span class="mono">{{ doc.filename }}</span></p>
+  {% if doc.candidates %}
+  <table>
+    <tr><th>Value</th><th>Type</th><th>Page</th><th>Confidence</th><th>Why</th></tr>
+    {% for c in doc.candidates %}
+    <tr>
+      <td class="mono">{{ c.value }}</td>
+      <td class="mono">{{ c.pii_type or 'unidentified' }}</td>
+      <td>{{ c.page }}</td>
+      <td>{{ c.confidence }}</td>
+      <td class="mono">{{ c.evidence | join(', ') }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}
   <ul class="tokens">{% for w in doc.warnings %}<li class="mono">{{ w }}</li>{% endfor %}</ul>
+  {% endif %}
   {% endfor %}
 </div>
 {% endif %}

@@ -119,23 +119,48 @@ to that label.
 A new form family still needs a map. What it no longer needs is a new map every
 year.
 
-## The audit layer
+## The coverage layer
 
-After location, `core/detect.py` scans the page for PII-shaped text the map did not
-claim, and reports it as a **coverage warning**. It never redacts anything.
+After location, `detect/` scans the page for PII the field map did not claim and
+reports it as a **coverage warning**. It never redacts anything.
 
-It is deliberately not the detector. Measured against 28 realistic PII variants
-these patterns recall about a third — they miss lowercase city lines, addresses with
-no house number (`PO BOX 1234`, `ONE MARKET PLAZA`), foreign postal formats,
-unhyphenated and masked SSNs, and every personal name. Each of those is a *format*
-miss for a value sitting exactly where the label-driven pass finds it, which is the
-whole argument for locating by label rather than by content.
+This is the question `verify_labels` cannot ask. That check iterates the *map* and
+asks whether each label it names is on the page, so it can confirm the fields the
+map lists are present and can never ask whether fields exist that the map omits.
 
-What it is good for is noticing when a map goes stale: if a revision adds a field
-the map does not describe, the value surfaces as a warning instead of passing
-through silently. Precision is what makes that usable — against 38 distractors drawn
-from tax-form furniture (amounts, dates, line numbers, form titles) it raises
-nothing. A noisy audit is one people learn to ignore.
+Two layers, because neither answers it alone.
+
+**Structural.** Filled-in text is stylistically distinct from the form template, so
+a value can be recognised as *data* without reading it. The style is learned per
+document from what `locate()` claimed — never hardcoded, because the two revisions
+share no fill style at all: 2021 fills in Helvetica-Bold 9/10pt against a 7.2–8pt
+template, 2025 in base-14 Helvetica against subset-embedded faces. Any fixed rule
+fits one and fails the other.
+
+It has one blind spot, and it is structural rather than incidental: the style is
+learned from claimed examples, so a revision that moves *every* field of a style
+out of the map leaves that style unrecognisable. It also cannot see digit-shaped
+values, because no filter that removes `125,000` keeps `000-00-0000`.
+
+**Patterns.** Structured identifiers by shape, wherever they sit, which is exactly
+the blind spot above. Validation — SSN area and group rules, the IRS EIN prefix
+set, ITIN group ranges, the ABA 3-7-1 routing checksum — decides *confidence*,
+never survival. A shape that fails its validator is still reported, at low
+confidence: both fixtures use placeholder identifiers that no validator accepts,
+and suppressing on a failed validator made detection silent on the two most
+obviously SSN-shaped strings in the repository.
+
+`ROUTING`, `BANK_ACCOUNT` and `DOB` fire only under a matching label. A nine-digit
+run is equally an unhyphenated SSN or an invoice reference, and a tax form is full
+of dates.
+
+Against the 24 realistic variants and 38 distractors the previous regex audit
+shipped with, recall went from 33% to 67% with **false positives still at zero**.
+Nothing it caught was lost. The remaining misses are masked identifiers, two
+foreign postal formats, and names — which are out of policy.
+
+On a fitting map both fixtures produce **no warnings at all**. That number matters
+as much as recall: a noisy audit is one people learn to ignore.
 
 ## Extraction
 
@@ -198,8 +223,9 @@ rules 2 and 3. The text-layer gate catches pure scans; it does not catch a
 print-to-PDF that kept its text layer.
 
 **Unmapped form families still quarantine.** A 1099 with no concept map is refused.
-Best-effort detector-only scrubbing was considered and rejected: at ~32% recall it
-would ship files labelled "scrubbed" that are not.
+Best-effort detector-only scrubbing was considered and rejected. Detection is a
+coverage check, not a locator: at 67% recall it would ship files labelled
+"scrubbed" that are not.
 
 **Non-text PII is not handled.** `apply_redactions()` does not touch the document
 info dictionary, XMP metadata, embedded files, or annotations. In a real firm's K-1,
@@ -229,7 +255,7 @@ reach that bar.
 core/
   extract.py    PDF bytes -> positioned line segments (row grouping + gap splitting)
   fieldmap.py   normalize(), identify(), find_label(), discover_field(), locate()
-  detect.py     content-pattern audit; reports, never redacts
+  piitypes.py   the canonical PII type vocabulary
   tokens.py     minting, batch-wide assignment, discovery regex
   keys.py       wrap / unwrap            <- the only file a KMS swap touches
   crypto.py     AAD, encrypt / decrypt, token hashing
@@ -237,7 +263,16 @@ core/
   redact.py     tokens in, values back out, styling preserved
   verify.py     the release gates
   pipeline.py   scrub_batch(), restore_batch(), match_document()
+detect/
+  __init__.py   detect() -- the only public entry point
+  adapter.py    extracted lines -> items, and the field map's own geometry
+  patterns.py   structured identifiers, by shape then by validator
+  coverage.py   filled-in text the map does not account for
+  labels.py     label association; gates the types shape cannot justify
+  merge.py      overlap precedence, dedupe, confidence
+  policy.py     which types, and the floor that cannot be switched off
 forms/          concept maps, one JSON per form family
+eval/           per-type recall and review rate; the corpus and its answer keys
 web/            FastAPI app and templates
 cli.py          command line harness over the same pipeline functions
 ```
@@ -250,7 +285,8 @@ python -m pytest tests/ -q
 
 Notable cases: the two-column collisions in `test_extract.py`; one concept map
 extracting both revisions, and the rule-ordering regression, in `test_fieldmap.py`;
-the documented recall limit in `test_detect.py`; AAD misuse in `test_crypto.py`; a
+the stale-map matrix across both revisions in `test_detect_coverage.py`, and the
+carried-forward precision and recall lists in `test_detect_patterns.py`; AAD misuse in `test_crypto.py`; a
 raw-file scan proving no plaintext reaches the database in `test_vault.py`; style
 fidelity in `test_redact.py`; and in `test_pipeline.py`, that a partner shared across
 a 2021 and a 2025 K-1 collapses to one token, and that both restore pixel-identically.
