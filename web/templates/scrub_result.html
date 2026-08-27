@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Batch scrubbed</h1>
+
+<p>Keep this job ID. Restoring these documents is impossible without it.</p>
+<p class="jobid mono">{{ result.job_id }}</p>
+
+{% if result.quarantined %}
+<div class="callout warn">
+  <h2>{{ result.quarantined|length }} of {{ result.scrubbed|length + result.quarantined|length }}
+      file(s) were not scrubbed</h2>
+  <p>These files are <strong>not</strong> in the download and still contain their original data.</p>
+  <table>
+    <tr><th>File</th><th>Reason</th></tr>
+    {% for doc in result.quarantined %}
+    <tr><td class="mono">{{ doc.filename }}</td><td>{{ doc.reason }}</td></tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+{% set flagged = result.scrubbed | selectattr('warnings') | list %}
+{% if flagged %}
+<div class="callout warn">
+  <h2>Possible missed values</h2>
+  <p>These look like PII but are not described by the field map for this form.
+     They were <strong>not</strong> replaced. This usually means the form has a
+     field the map does not yet cover.</p>
+  {% for doc in flagged %}
+  <p><span class="mono">{{ doc.filename }}</span></p>
+  <ul class="tokens">{% for w in doc.warnings %}<li class="mono">{{ w }}</li>{% endfor %}</ul>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if result.scrubbed %}
+<h2>Scrubbed <span class="ok">&#10003;</span></h2>
+<table>
+  <tr><th>File</th><th>Form</th><th>Pages</th><th>Replaced</th></tr>
+  {% for doc in result.scrubbed %}
+  <tr>
+    <td class="mono">{{ doc.filename }}</td>
+    <td class="mono">{{ doc.form_id }}</td>
+    <td>{{ doc.page_count }}</td>
+    <td>{{ doc.replaced_count }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% if download %}<a class="dl" href="/download/{{ download }}">Download scrubbed files (.zip)</a>
+<p class="hint">This link works once and expires in 15 minutes. Nothing is stored on disk.</p>{% endif %}
+{% else %}
+<div class="callout bad"><strong>No files were scrubbed.</strong></div>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,21 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Jobs</h1>
+<p class="lede">Filenames are encrypted at rest; open a job to see them.</p>
+{% if jobs %}
+<table>
+  <tr><th>Job</th><th>Created</th><th>Expires</th><th>Documents</th><th>Status</th></tr>
+  {% for job in jobs %}
+  <tr>
+    <td><a class="mono" href="/restore?job_id={{ job.id }}">{{ job.id }}</a></td>
+    <td>{{ job.created_at[:19].replace('T', ' ') }}</td>
+    <td>{{ job.expires_at[:10] }}</td>
+    <td>{{ job.document_count }}</td>
+    <td>{{ job.status }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<div class="panel">No jobs yet. <a href="/">Scrub a batch</a> to get started.</div>
+{% endif %}
+{% endblock %}

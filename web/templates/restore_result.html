@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Restore complete</h1>
+
+{% set stuck = result.restored | selectattr('unresolved') | list %}
+{% if stuck or result.unmatched %}
+<div class="callout warn">
+  <h2>Some content could not be restored</h2>
+  {% if result.unmatched %}
+  <p>Not matched to any document in this job:</p>
+  <table>
+    <tr><th>File</th><th>Reason</th></tr>
+    {% for doc in result.unmatched %}
+    <tr><td class="mono">{{ doc.filename }}</td><td>{{ doc.reason }}</td></tr>
+    {% endfor %}
+  </table>
+  {% endif %}
+  {% for doc in stuck %}
+  <p><span class="mono">{{ doc.filename }}</span> still contains
+     {{ doc.unresolved|length }} token(s) that did not resolve in this job:</p>
+  <ul class="tokens">{% for token in doc.unresolved %}<li class="mono">{{ token }}</li>{% endfor %}</ul>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if result.restored %}
+<h2>Restored</h2>
+<table>
+  <tr><th>File</th><th>Tokens found</th><th>Resolved</th><th>Matched document</th></tr>
+  {% for doc in result.restored %}
+  <tr>
+    <td class="mono">{{ doc.filename }}</td>
+    <td>{{ doc.tokens_found }}</td>
+    <td>{% if doc.tokens_resolved == doc.tokens_found %}<span class="ok">{{ doc.tokens_resolved }}</span>
+        {% else %}{{ doc.tokens_resolved }}{% endif %}</td>
+    <td class="mono">{{ doc.doc_id[:8] if doc.doc_id else 'unmatched' }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% if download %}<a class="dl" href="/download/{{ download }}">Download restored files (.zip)</a>
+<p class="hint">A reconstruction, not the original file &mdash; font metrics differ slightly.</p>{% endif %}
+{% endif %}
+{% endblock %}

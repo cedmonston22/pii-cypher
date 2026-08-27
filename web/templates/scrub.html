@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Scrub a batch</h1>
+<p class="lede">Upload Schedule K-1s. Identifiers are replaced with tokens and the
+originals are encrypted under a key belonging to this batch.</p>
+
+<form class="panel" action="/scrub" method="post" enctype="multipart/form-data">
+  <label for="files">PDF files</label>
+  <input id="files" type="file" name="files" accept="application/pdf" multiple required>
+  <p class="hint">Up to 25 files, 10&nbsp;MB each, 50&nbsp;MB per batch, 20 pages per document.
+  Processing is synchronous, so the batch is capped to keep the request responsive.</p>
+  <button type="submit">Scrub batch</button>
+</form>
+
+<h2>What is replaced</h2>
+<table>
+  <tr><th>Type</th><th>Fields on the K-1</th></tr>
+  <tr><td>EIN</td><td>A &mdash; partnership employer identification number</td></tr>
+  <tr><td>SSN / TIN</td><td>E &mdash; partner's SSN or TIN</td></tr>
+  <tr><td>Address</td><td>B and F &mdash; street, city, state and ZIP</td></tr>
+</table>
+<p class="hint">Names are deliberately out of policy and are left on the form.</p>
+{% endblock %}
