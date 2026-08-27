@@ -14,6 +14,7 @@ from core.pipeline import (
     MAX_FILES,
     BatchTooLarge,
     NotAPdf,
+    PolicyMismatch,
     accept_batch,
     match_document,
     restore_batch,
@@ -529,3 +530,41 @@ def test_explicit_job_id_still_filters(db, k1_bytes):
     )
     assert [d.filename for d in result.restored] == ["a.pdf"]
     assert [d.filename for d in result.unmatched] == ["b.pdf"]
+
+
+def test_a_policy_matching_no_field_is_quarantined_not_reported_scrubbed(db, k1_bytes):
+    """A policy in a different vocabulary must not pass as a clean scrub.
+
+    Without this guard the filter empties the field list, ``redact`` draws
+    nothing, and both release gates pass vacuously -- there is no surviving
+    value among no values, and no missing token among no tokens. The batch was
+    reported as scrubbed while the document still carried every identifier.
+    """
+    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["SSN", "EIN"]})
+
+    assert result.scrubbed == []
+    assert len(result.quarantined) == 1
+    assert "PolicyMismatch" in result.quarantined[0].reason
+
+
+def test_the_mismatch_reason_names_both_vocabularies(db, k1_bytes):
+    """The failure has to be self-explanatory: drift is invisible otherwise."""
+    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["SSN"]})
+
+    reason = result.quarantined[0].reason
+    assert "'SSN'" in reason, "the reason must show what the policy asked for"
+    assert "'ssn_tin'" in reason, "and what the map actually describes"
+    assert "us-1065-k1" in reason
+
+
+def test_a_deliberately_narrow_policy_still_scrubs(db, k1_bytes):
+    """Sharing one type is enough. Narrow is not the same as mismatched."""
+    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["ein"]})
+
+    assert len(result.scrubbed) == 1
+    doc = result.scrubbed[0]
+    assert doc.replaced_count == 1
+
+    text = extract_all_text(doc.pdf_bytes)
+    assert "00-0000000" not in text
+    assert "000-00-0000" in text, "an out-of-policy value must be left alone"

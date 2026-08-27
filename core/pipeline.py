@@ -51,11 +51,29 @@ DEFAULT_POLICY: dict[str, Any] = {"pii_types": ["ein", "ssn_tin", "address"]}
 # considered the same document. Below it, ask the user rather than guess.
 MATCH_THRESHOLD = 0.5
 
+class PolicyMismatch(Exception):
+    """Raised when a policy and a field map name no pii_type in common.
+
+    A policy that matches nothing is not a policy that redacts nothing quietly:
+    ``_in_policy`` returns an empty list, ``redact`` draws nothing, and both
+    release gates pass vacuously -- ``verify_scrubbed`` finds no surviving value
+    among no values, and ``verify_tokens_present`` finds no missing token among
+    no tokens. The batch is then reported as scrubbed while every document is
+    returned with its SSN, EIN and addresses intact.
+
+    Two vocabularies drifting apart is the way this happens in practice: a field
+    map saying ``ssn_tin`` against a policy saying ``SSN``. Deliberately narrow
+    policies are unaffected -- ``{"pii_types": ["ein"]}`` against a map that
+    describes an EIN shares a type and passes.
+    """
+
+
 # Quarantine is expected for these; anything else is a bug and must propagate.
 QUARANTINE_ERRORS = (
     NoTextLayer,
     UnknownForm,
     AnchorMismatch,
+    PolicyMismatch,
     PlaintextSurvived,
     ReplacementTooSmall,
     TokenNotWritten,
@@ -168,6 +186,21 @@ def _in_policy(fields: list[Field], policy: dict[str, Any]) -> list[Field]:
     return [f for f in fields if f["pii_type"] in allowed]
 
 
+def _check_policy_fits(field_map: dict[str, Any], policy: dict[str, Any]) -> None:
+    """Raise unless the policy and the map share at least one pii_type.
+
+    Raises:
+        PolicyMismatch: naming both vocabularies, so the drift is obvious.
+    """
+    allowed = set(policy.get("pii_types", []))
+    described = {f["pii_type"] for f in field_map["fields"]}
+    if not allowed & described:
+        raise PolicyMismatch(
+            f"policy types {sorted(allowed)} match nothing in field map "
+            f"{field_map['form_id']!r}, which describes {sorted(described)}"
+        )
+
+
 def scrub_one(
     pdf_bytes: bytes,
     job_id: str,
@@ -188,6 +221,7 @@ def scrub_one(
         raise BatchTooLarge(f"document exceeds {MAX_PAGES} pages")
 
     field_map = identify(pages, field_maps)
+    _check_policy_fits(field_map, policy)
     verify_labels(pages, field_map)
     located = propagate(pages, locate(pages, field_map))
 
