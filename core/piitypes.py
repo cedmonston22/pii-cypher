@@ -12,6 +12,13 @@ scrubbed while every document still carries its identifiers.
 ``core.pipeline.PolicyMismatch`` catches that at run time; ``canonical`` and
 ``PII_TYPES`` are what stop it arising in the first place.
 
+The set is what a Schedule K-1 can carry, plus the two shapes the coverage
+filter would otherwise swallow. EMAIL, ROUTING and BANK_ACCOUNT were here and
+were removed: a K-1 has none of them, and a value of any of those shapes still
+surfaces as unaccounted-for fill, so naming them bought nothing and carried a
+checksum that could never run. A later form family that labels them can have
+them back in three lines.
+
 Names are deliberately absent. They are out of policy on a K-1 and stay on the
 form; see ``skip_lines`` in ``forms/us-1065-k1.json``.
 """
@@ -25,11 +32,8 @@ PiiType = Literal[
     "ITIN",
     "EIN",
     "ADDRESS",
-    "EMAIL",
     "PHONE",
     "DOB",
-    "BANK_ACCOUNT",
-    "ROUTING",
 ]
 
 PII_TYPES: frozenset[str] = frozenset(get_args(PiiType))

@@ -7,11 +7,10 @@ a different candidate from one floating in a table, and that agreement between
 two independent signals is what earns a candidate high confidence. Label
 association never mints a candidate on its own.
 
-The second is gating. ROUTING, BANK_ACCOUNT and DOB have no shape that
-distinguishes them from tax-form furniture -- a nine-digit run is equally an
-unhyphenated SSN or an invoice reference, and a tax form is full of dates. For
-those types the label is not corroboration, it is the whole basis, so they are
-minted here rather than in ``detect.patterns``.
+The second is gating. DOB has no shape that distinguishes it from tax-form
+furniture -- a form is full of dates, and a period end looks exactly like a
+birthday. For that type the label is not corroboration, it is the whole basis,
+so it is minted here rather than in ``detect.patterns``.
 
 Position is always relative. Absolute coordinates are a template in disguise:
 between the 2021 and 2025 Schedule K-1 the IRS inverted the label-to-value
@@ -38,10 +37,7 @@ SENSITIVE_LABELS: dict[str, tuple[str, ...]] = {
     "ITIN": ("itin", "individual taxpayer identification"),
     "EIN": ("ein", "employer identification number"),
     "ADDRESS": ("address", "city state and zip", "street", "zip code"),
-    "ROUTING": ("routing", "aba", "rtn"),
-    "BANK_ACCOUNT": ("account number", "bank account", "deposit account"),
     "DOB": ("date of birth", "birth date", "dob"),
-    "EMAIL": ("email", "e mail"),
     "PHONE": ("phone", "telephone"),
 }
 
@@ -87,9 +83,9 @@ def label_suggests(label: str | None, pii_type: str) -> bool:
 def label_only(items: list[Item], pages: list[list[Line]], geo: Geometry) -> list[Candidate]:
     """Mint the types that a shape alone cannot justify.
 
-    Confidence is capped at medium even with a matching label and a passing
-    checksum. BANK_ACCOUNT has no checksum at all, and a routing number under a
-    label is still a routing number the document may simply be quoting.
+    Confidence is capped at medium even with a matching label and a valid
+    date. A date of birth under a label is still a date the document may be
+    quoting, and nothing here can tell whose birthday it is.
     """
     out: list[Candidate] = []
 

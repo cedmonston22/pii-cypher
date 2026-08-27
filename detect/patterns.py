@@ -16,6 +16,13 @@ the forms with no house number.
 
 Validation never widens recall -- every validated type is matched by shape
 first. It only decides whether a candidate is worth acting on.
+
+PHONE and DOB are not fields a Schedule K-1 carries. They are here because
+coverage.amountish discards phone- and date-shaped text as form furniture, so
+these patterns are the only thing standing between such a value and silence.
+EMAIL, ROUTING and BANK_ACCOUNT were removed for the opposite reason: the
+filter keeps their shapes, so they still surface as unaccounted-for fill
+without a pattern naming them.
 """
 
 from __future__ import annotations
@@ -68,11 +75,8 @@ LINE_PATTERNS: dict[str, re.Pattern[str]] = {
     "ADDRESS_LOCALITY": re.compile(
         r"^[A-Za-z .’'-]+,\s*[A-Za-z]{2}\s+\d{5}(-\d{4})?$"
     ),
-    "EMAIL": re.compile(r"^[\w.+-]+@[\w-]+\.[\w.-]+$"),
     "PHONE": re.compile(r"^(\+?1[-. ]?)?\(?[2-9]\d{2}\)?[-. ]?[2-9]\d{2}[-. ]?\d{4}$"),
     "DOB": re.compile(r"^(\d{1,2}[/-]\d{1,2}[/-]\d{4}|\d{4}-\d{2}-\d{2})$"),
-    "ROUTING": re.compile(r"^\d{9}$"),
-    "BANK_ACCOUNT": re.compile(r"^\d{8,17}$"),
 }
 
 # Distinctive enough to find inside a longer line without false alarms.
@@ -80,17 +84,17 @@ EMBEDDED_PATTERNS: dict[str, re.Pattern[str]] = {
     "SSN": re.compile(r"(?<!\d)(?!9)\d{3}-\d{2}-\d{4}(?!\d)"),
     "ITIN": re.compile(r"(?<!\d)9\d{2}-\d{2}-\d{4}(?!\d)"),
     "EIN": re.compile(r"(?<!\d)\d{2}-\d{7}(?!\d)"),
-    "EMAIL": re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b"),
 }
 
-# Types a bare digit run cannot be trusted to indicate. A nine-digit number is
-# an unhyphenated SSN, a routing number, or an invoice reference, and nothing
-# about the digits separates them. These fire only where a label says what they
-# are; see detect.labels. Emitting them unconditionally is how a review queue
-# becomes something nobody reads.
-# DOB joins them: a tax form is full of dates, and 12/31/2021 is a period
-# end, not a birthday. Nothing about the digits tells the two apart.
-LABEL_ONLY: frozenset[str] = frozenset({"ROUTING", "BANK_ACCOUNT", "DOB"})
+# A tax form is full of dates, and 12/31/2021 is a period end rather than a
+# birthday. Nothing about the digits tells the two apart, so DOB fires only
+# where a label says what it is; see detect.labels. Emitting it on shape alone
+# is how a review queue becomes something nobody reads.
+#
+# DOB is here for a reason that is easy to undo by accident: coverage.amountish
+# discards date-shaped text as form furniture, so if this pattern goes, nothing
+# catches a birthday at all. See the coupling test in test_detect_patterns.
+LABEL_ONLY: frozenset[str] = frozenset({"DOB"})
 
 # Toll-free ranges are never a person's number. The IRS help line is printed on
 # the form itself, so without this every K-1 reports 800-829-1040 as PII.
@@ -141,20 +145,6 @@ def _valid_ein(text: str) -> bool:
     return len(digits) == 9 and digits[:2] in EIN_PREFIXES
 
 
-def _valid_routing(text: str) -> bool:
-    """ABA 3-7-1 weighted mod-10.
-
-    Not Luhn. Luhn is the card-number checksum and applies to no type in this
-    vocabulary; using it here would reject valid routing numbers and accept
-    invalid ones, both silently.
-    """
-    digits = _digits(text)
-    if len(digits) != 9:
-        return False
-    weights = (3, 7, 1, 3, 7, 1, 3, 7, 1)
-    return sum(int(c) * w for c, w in zip(digits, weights)) % 10 == 0
-
-
 def _is_toll_free(text: str) -> bool:
     digits = _digits(text)
     if len(digits) == 11 and digits[0] == "1":
@@ -176,7 +166,6 @@ VALIDATORS = {
     "SSN": _valid_ssn,
     "ITIN": _valid_itin,
     "EIN": _valid_ein,
-    "ROUTING": _valid_routing,
     "DOB": _valid_dob,
 }
 

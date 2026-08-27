@@ -8,9 +8,22 @@ what replaced them.
 
 import pytest
 
+from core.extract import Line
 from core.fieldmap import normalize
+from core.piitypes import PII_TYPES
 from core.tokens import PREFIX
-from detect.patterns import EIN_PREFIXES, LABEL_ONLY, LINE_PATTERNS, excluded, scan, valid
+from detect.adapter import Geometry, _joins
+from detect.coverage import amountish
+from detect.labels import label_only
+from detect.patterns import (
+    EIN_PREFIXES,
+    LABEL_ONLY,
+    LINE_PATTERNS,
+    _canonical,
+    excluded,
+    scan,
+    valid,
+)
 from detect.types import Item, dense
 
 
@@ -117,8 +130,6 @@ def test_names_remain_out_of_scope(text):
         ("EIN", "45-1234567", True),
         ("ITIN", "912-70-1234", True),
         ("ITIN", "912-01-1234", False),  # group outside the assigned ranges
-        ("ROUTING", "011000015", True),  # ABA 3-7-1 checksum
-        ("ROUTING", "011000016", False),
         ("DOB", "01/15/1980", True),
         ("DOB", "13/45/1980", False),
     ],
@@ -177,13 +188,165 @@ def test_the_tools_own_tokens_are_not_reported_as_pii():
 
 
 def test_label_only_types_never_fire_on_shape_alone():
-    """A bare nine-digit run is an SSN, a routing number or an invoice."""
+    """A date on a tax form is overwhelmingly a period end, not a birthday."""
     for pii_type in LABEL_ONLY:
         assert pii_type in LINE_PATTERNS
-    assert "ROUTING" not in {c.pii_type for c in scan([_item("011000015")])}
+    assert "DOB" not in {c.pii_type for c in scan([_item("03/14/1979")])}
 
 
 def test_ein_prefixes_are_a_closed_set():
     assert "00" not in EIN_PREFIXES
     assert "45" in EIN_PREFIXES
     assert all(len(p) == 2 and p.isdigit() for p in EIN_PREFIXES)
+
+
+# --------------------------------------------------------------------------
+# why the vocabulary is the size it is
+#
+# Six types, and each one has to justify itself. Four are what a Schedule K-1
+# carries. The other two are here only because the coverage filter would
+# otherwise swallow them, and these tests are what stop someone removing them
+# on the reasonable-sounding grounds that a K-1 has no phone numbers.
+# --------------------------------------------------------------------------
+
+
+def test_phone_has_no_backstop_but_this_pattern():
+    """Why PHONE stays despite not being a field a K-1 carries.
+
+    coverage.amountish discards phone-shaped text as form furniture, which is
+    what stops it reporting date-like line items on every document. The cost is
+    that the structural layer cannot see a real phone number, so this pattern is
+    the only thing between one and silence.
+    """
+    assert amountish("415-555-0142"), "the coverage layer discards this shape"
+    assert _values("415-555-0142"), "so the pattern layer is the only thing left"
+
+
+def test_an_unlabelled_date_of_birth_is_caught_by_nothing():
+    """A documented hole, not an oversight.
+
+    The filter discards date-shaped text, and DOB is label-gated so scan() will
+    not mint one from shape. A birthday with no label near it therefore reaches
+    no layer at all.
+
+    The alternative is worse. Firing DOB on shape means reporting every period
+    end, every "For calendar year 2021", and every line-item date on the form --
+    the noise the filter exists to remove. A form that labels a date of birth is
+    handled; one that does not is a limitation worth stating rather than a bug
+    worth fixing here.
+    """
+    assert amountish("03/14/1979"), "the coverage layer discards it"
+    assert not _values("03/14/1979"), "and the pattern layer will not mint it unlabelled"
+
+
+@pytest.mark.parametrize("text", ["alex@example.com", "011000015", "1234567890123"])
+def test_types_a_k1_does_not_carry_were_dropped_without_losing_them(text):
+    """Why EMAIL, ROUTING and BANK_ACCOUNT could go.
+
+    The filter keeps their shapes, so a value of any of them still surfaces as
+    unaccounted-for fill. Dropping the pattern lost the label on the finding,
+    not the finding -- which is the opposite of the PHONE and DOB case above.
+    """
+    assert not amountish(text), "the coverage layer keeps this shape"
+    assert text.upper() not in {c.pii_type for c in scan([_item(text)]) if c.pii_type}
+
+
+def test_the_vocabulary_is_closed():
+    """Every type has a pattern, and every pattern names a real type."""
+    named = {_canonical(name) for name in LINE_PATTERNS}
+    assert named == PII_TYPES
+
+
+# --------------------------------------------------------------------------
+# the label-gated path
+#
+# Never exercised by either fixture: no K-1 labels a date of birth. It needs no
+# PDF to test, only lines in a template style with a value beneath them.
+# --------------------------------------------------------------------------
+
+
+def _line(text, x0, top, font="Helvetica-Bold", size=9.0):
+    return Line(text=text, x0=x0, top=top, x1=x0 + 60, bottom=top + 9,
+                page=1, fontname=font, size=size)
+
+
+def _geo(fill=("Helvetica-Bold", 9.0), x0=50.0):
+    return Geometry(claimed=frozenset(), skipped=frozenset(), ignored=frozenset(),
+                    fill_styles=frozenset({fill}), label_x0=(x0,), col_tol=90.0)
+
+
+def _from_line(line):
+    return _item(line["text"])._replace() if hasattr(_item(line["text"]), "_replace") else Item(
+        text=line["text"], norm=normalize(line["text"]), dense=dense(line["text"]),
+        page=line["page"], bbox=(line["x0"], line["top"], line["x1"], line["bottom"]),
+        source="native_text", fontname=line["fontname"], size=line["size"])
+
+
+def test_a_dob_fires_under_a_label_and_not_otherwise():
+    """The label is the whole basis, not corroboration.
+
+    A form is full of dates and a period end looks exactly like a birthday, so
+    shape alone must not mint one.
+    """
+    label = _line("Date of birth", 50.0, 100.0, "Helvetica", 7.0)
+    value = _line("03/14/1979", 50.0, 112.0)
+    pages = [[label, value]]
+
+    got = label_only([_from_line(value)], pages, _geo())
+    assert [(c.pii_type, c.value) for c in got] == [("DOB", "03/14/1979")]
+    assert got[0].confidence == "medium", "a quoted date is not a person's birthday"
+    assert any(e.startswith("label:") for e in got[0].evidence)
+
+
+def test_the_same_date_under_an_unrelated_label_is_not_a_dob():
+    label = _line("For calendar year", 50.0, 100.0, "Helvetica", 7.0)
+    value = _line("03/14/1979", 50.0, 112.0)
+    assert label_only([_from_line(value)], [[label, value]], _geo()) == []
+
+
+def test_a_value_is_not_read_as_its_own_label():
+    """Fill styles are excluded when looking upward for a label.
+
+    On a K-1 the address lines sit directly under the partner name, so without
+    the style test a value would be treated as the label of the value beneath.
+    """
+    above = _line("Date of birth", 50.0, 100.0)          # in the FILL style
+    value = _line("03/14/1979", 50.0, 112.0)
+    assert label_only([_from_line(value)], [[above, value]], _geo()) == []
+
+
+# --------------------------------------------------------------------------
+# split identifiers
+#
+# Neither fixture splits one, so this path has never run on a real document.
+# --------------------------------------------------------------------------
+
+
+def test_an_identifier_split_across_spans_is_rejoined():
+    """PDFs routinely render 123-45-6789 as two spans, and a regex over either
+    half finds nothing."""
+    parts = [_line("123-45-", 50.0, 200.0), _line("6789", 112.0, 200.0)]
+    joined = list(_joins(parts))
+
+    assert [i["text"] for i in joined] == ["123-45-6789"]
+    assert joined[0]["source"] == "joined"
+    assert "SSN" in {c.pii_type for c in scan(joined)}
+
+
+def test_unrelated_columns_are_not_fused():
+    """The guard that makes joining safe.
+
+    Without the shape test, "General partner" and "LLC member-manager" -- 80pt
+    apart on one row of the 2021 fixture -- fuse into a single item spanning
+    both columns.
+    """
+    parts = [_line("General partner", 50.0, 200.0), _line("LLC member-manager", 211.0, 200.0)]
+    assert list(_joins(parts)) == []
+
+
+def test_a_join_needs_a_digit_and_a_small_gap():
+    far = [_line("123-45-", 50.0, 200.0), _line("6789", 300.0, 200.0)]
+    assert list(_joins(far)) == [], "a wide gap is a different column"
+
+    wordy = [_line("Alex", 50.0, 200.0), _line("Tester", 112.0, 200.0)]
+    assert list(_joins(wordy)) == [], "two words are not a split identifier"

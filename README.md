@@ -144,15 +144,24 @@ values, because no filter that removes `125,000` keeps `000-00-0000`.
 
 **Patterns.** Structured identifiers by shape, wherever they sit, which is exactly
 the blind spot above. Validation — SSN area and group rules, the IRS EIN prefix
-set, ITIN group ranges, the ABA 3-7-1 routing checksum — decides *confidence*,
-never survival. A shape that fails its validator is still reported, at low
+set, ITIN group ranges — decides *confidence*, never survival. A shape that fails its validator is still reported, at low
 confidence: both fixtures use placeholder identifiers that no validator accepts,
 and suppressing on a failed validator made detection silent on the two most
 obviously SSN-shaped strings in the repository.
 
-`ROUTING`, `BANK_ACCOUNT` and `DOB` fire only under a matching label. A nine-digit
-run is equally an unhyphenated SSN or an invoice reference, and a tax form is full
-of dates.
+The vocabulary is six types, and each earns its place. `SSN`, `ITIN`, `EIN` and
+`ADDRESS` are what the form carries — `ITIN` because field E is "SSN *or TIN*" and a
+foreign partner has one. `PHONE` and `DOB` are not on a K-1 at all; they are there
+because the furniture filter discards their shapes, so without a pattern nothing
+would ever see them. `EMAIL`, `ROUTING` and `BANK_ACCOUNT` were removed for the
+opposite reason: the filter keeps *their* shapes, so those values still surface as
+unaccounted-for fill and naming them bought nothing.
+
+`DOB` fires only under a matching label, because a tax form is full of dates and a
+period end looks exactly like a birthday. The consequence is a stated limitation
+rather than a hidden one: an unlabelled date of birth reaches no layer at all.
+Firing on shape would mean reporting every date on the form, which is the noise the
+filter exists to remove.
 
 Against the 24 realistic variants and 38 distractors the previous regex audit
 shipped with, recall went from 33% to 67% with **false positives still at zero**.

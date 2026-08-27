@@ -23,10 +23,7 @@ PRECEDENCE: tuple[str, ...] = (
     "ITIN",
     "SSN",
     "EIN",
-    "ROUTING",
-    "BANK_ACCOUNT",
     "DOB",
-    "EMAIL",
     "PHONE",
     "ADDRESS",
 )
