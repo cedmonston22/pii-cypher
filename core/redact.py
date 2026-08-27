@@ -19,6 +19,7 @@ import re
 import pymupdf
 
 from core.fieldmap import Field
+from core.tokens import display_candidates
 
 DEFAULT_FONT = "helv"
 FALLBACK_SIZE = 9.0
@@ -283,7 +284,18 @@ def restore_pdf(pdf_bytes: bytes, value_by_token: dict[str, str]) -> tuple[bytes
         placed: set[str] = set()
         for page_no, page in enumerate(doc):
             for token, value in value_by_token.items():
-                for rect in page.search_for(token):
+                # Longest form first. A token whose page shows a revealed digit
+                # run must be matched whole: search_for returns only the needle's
+                # glyphs, so matching the bare token would leave the run outside
+                # the removal box, surviving apply_redactions and overprinting
+                # the restored value. Matching a six-digit tail as a four-digit
+                # one strands two digits the same way.
+                rects: list = []
+                for form in display_candidates(token, value):
+                    rects = page.search_for(form)
+                    if rects:
+                        break
+                for rect in rects:
                     span = _span_at(page, rect)
                     font = base14(span.get("font")) if span else DEFAULT_FONT
                     size = float(span["size"]) if span else 0.0

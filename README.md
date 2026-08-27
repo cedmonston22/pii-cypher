@@ -60,6 +60,40 @@ unreadable file is quarantined and the rest of the batch continues.
 Names are deliberately out of policy and stay on the form. `skip_lines: 1` drops the
 first line of each address box, which is the name.
 
+Both columns of that table are choices, not fixtures. A policy names which types to
+tokenise, and unticking one leaves that identifier readable on the document — the
+result page and `pii-scrubber scrub` both say which types were left and how many,
+because the detection layer cannot: it runs against everything `locate()` claimed,
+before the policy filter, so a field excluded by policy reads to it as claimed.
+
+### Showing the last digits
+
+A recipient holding `PII-7ZURMBHA` cannot match it against their own records. A
+policy may leave a trailing run of digits readable instead:
+
+```json
+{ "pii_types": ["SSN", "EIN", "ADDRESS"], "reveal_digits": { "EIN": 4 } }
+```
+
+```
+45-1234567   ->   PII-7ZURMBHA-4567   ->   45-1234567
+```
+
+The value is still encrypted whole and still restores whole. Only the drawing
+changes: the vault stores the bare token, `token_hashes` records the bare token, and
+restore reconstructs the on-page form from the value it just decrypted, so a document
+mixing counts across types still resolves without being told the policy.
+
+The range is 0 to 6, refused rather than clamped outside it. Six is the cap because
+that is where the setting stops being partial: an SSN and an EIN are both nine
+digits, so six leaves three hidden, and for a pre-2011 SSN the hidden leading run is
+a geographically assigned area number. At the top of the range this is closer to
+disclosure than to redaction.
+
+The separator is load-bearing. `TOKEN_RE` ends in a word boundary, so
+`PII-7ZURMBHA4567` matches nothing, `find_tokens` returns nothing, and every restore
+comes back unmatched. `test_the_separator_is_load_bearing` pins it.
+
 ## Restore identifies itself
 
 Restoring takes no job ID. Upload any scrubbed files and each one works out which
@@ -227,9 +261,13 @@ descender is both safe and neighbour-preserving.
 - Filenames are encrypted: `Smith_John_K1.pdf` is itself PII.
 - Uploaded bytes are never written to disk. Finished archives are held in memory and
   their download links are single-use with a 15-minute expiry.
-- Two release gates run before anything is returned: no original value may appear in
-  the output, and every token must have landed. The second exists because a
-  replacement can fail to render without raising.
+- Three release gates run before anything is returned: no original value may appear
+  in the output, every token must have landed, and no value may show more of itself
+  than the policy authorised. The second exists because a replacement can fail to
+  render without raising. The third is not implied by the first — `verify_scrubbed`
+  looks for whole values, so it passes cleanly over a page leaking the last six
+  digits of every identifier — and its message carries counts, never digits, because
+  `documents.reason` is plaintext while the filename beside it is encrypted.
 
 Jobs expire after 30 days; restore refuses an expired job rather than returning a
 partial result.

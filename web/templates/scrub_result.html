@@ -53,8 +53,36 @@
 </div>
 {% endif %}
 
+{% set left = result.scrubbed | selectattr('left_by_policy') | list %}
+{% if left %}
+<div class="callout warn">
+  <h2>Left readable by your policy</h2>
+  <p>These identifiers were found on the document and <strong>not</strong> replaced,
+     because their type was not ticked. They are readable in the files below.</p>
+  <table>
+    <tr><th>File</th><th>Type</th><th>Count</th></tr>
+    {% for doc in left %}{% for pii_type, count in doc.left_by_policy.items() %}
+    <tr>
+      <td class="mono">{{ doc.filename }}</td>
+      <td class="mono">{{ pii_type }}</td>
+      <td>{{ count }}</td>
+    </tr>
+    {% endfor %}{% endfor %}
+  </table>
+</div>
+{% endif %}
+
 {% if result.scrubbed %}
 <h2>Scrubbed <span class="ok">&#10003;</span></h2>
+{% if policy %}
+{% set revealed = policy.reveal_digits | default({}, true) %}
+<p class="hint">Tokenised: <span class="mono">{{ policy.pii_types | sort | join(', ') }}</span>.
+  {% for pii_type, n in revealed | dictsort %}{% if n %}
+  The last <strong>{{ n }}</strong> digits of each
+  <span class="mono">{{ pii_type }}</span> are readable on the page.
+  {% endif %}{% endfor %}
+</p>
+{% endif %}
 <table>
   <tr><th>File</th><th>Form</th><th>Pages</th><th>Replaced</th></tr>
   {% for doc in result.scrubbed %}

@@ -28,13 +28,17 @@ from core.fieldmap import (
     verify_labels,
 )
 from core.keys import generate_data_key, unwrap, wrap
+from core.piitypes import canonical
 from core.redact import ReplacementTooSmall, redact, restore_pdf
-from core.tokens import assign, find_tokens
+from core.tokens import assign, display, find_tokens
 from detect import CoverageGap, Report, detect
+from detect.policy import resolve_reveal
 from core.verify import (
+    OverDisclosed,
     PlaintextSurvived,
     TokenNotWritten,
     extract_all_text,
+    verify_disclosure,
     verify_scrubbed,
     verify_tokens_present,
 )
@@ -62,10 +66,13 @@ class PolicyMismatch(Exception):
     no tokens. The batch is then reported as scrubbed while every document is
     returned with its SSN, EIN and addresses intact.
 
-    Two vocabularies drifting apart is the way this happens in practice: a field
-    map saying ``ssn_tin`` against a policy saying ``SSN``. Deliberately narrow
-    policies are unaffected -- ``{"pii_types": ["EIN"]}`` against a map that
-    describes an EIN shares a type and passes.
+    Spelling drift used to be how this arose -- a map saying ``ssn_tin`` against
+    a policy saying ``SSN``. Both sides now run through ``canonical``, so that
+    particular case cannot happen any more. What remains is a policy that is
+    genuinely disjoint from the form: ``{"pii_types": ["PHONE"]}`` against a K-1,
+    which describes none. Deliberately narrow policies are unaffected --
+    ``{"pii_types": ["EIN"]}`` against a map that describes an EIN shares a type
+    and passes.
     """
 
 
@@ -79,6 +86,7 @@ QUARANTINE_ERRORS = (
     PlaintextSurvived,
     ReplacementTooSmall,
     TokenNotWritten,
+    OverDisclosed,
 )
 
 
@@ -105,6 +113,12 @@ class ScrubbedDoc:
     # screen. Not persisted: candidates carry values and documents.reason is
     # plaintext.
     candidates: tuple = ()
+    # Per type, how many located values the policy deliberately left on the
+    # page. Detection cannot report these -- it runs against everything
+    # located, so an excluded field reads as claimed -- and without them
+    # unticking a type yields a clean green result over a document that
+    # still carries the identifier.
+    left_by_policy: dict[str, int] = dataclass_field(default_factory=dict)
 
 
 @dataclass
@@ -187,8 +201,22 @@ def accept_batch(files: list[tuple[str, bytes]]) -> None:
         raise BatchTooLarge(f"batch of {total} bytes exceeds {MAX_BATCH_BYTES}")
 
 
+def _policy_types(policy: dict[str, Any]) -> set[str]:
+    """The types a policy names, canonicalised.
+
+    ``detect.policy.resolve`` already canonicalises the same dict. Doing it here
+    too is what stops one policy meaning two different things depending on which
+    subsystem reads it.
+
+    Raises:
+        UnknownPiiType: for a name outside the vocabulary. Louder than matching
+            nothing, which is the failure ``PolicyMismatch`` exists to catch.
+    """
+    return {canonical(name) for name in policy.get("pii_types", [])}
+
+
 def _in_policy(fields: list[Field], policy: dict[str, Any]) -> list[Field]:
-    allowed = set(policy.get("pii_types", []))
+    allowed = _policy_types(policy)
     return [f for f in fields if f["pii_type"] in allowed]
 
 
@@ -198,7 +226,7 @@ def _check_policy_fits(field_map: dict[str, Any], policy: dict[str, Any]) -> Non
     Raises:
         PolicyMismatch: naming both vocabularies, so the drift is obvious.
     """
-    allowed = set(policy.get("pii_types", []))
+    allowed = _policy_types(policy)
     described = {f["pii_type"] for f in field_map["fields"]}
     if not allowed & described:
         raise PolicyMismatch(
@@ -215,12 +243,14 @@ def scrub_one(
     encrypted: set[str],
     policy: dict[str, Any],
     field_maps: list[dict[str, Any]],
-) -> tuple[bytes, str, list[Field], list[vault.Entry], list[str], Report]:
+) -> tuple[
+    bytes, str, list[Field], list[vault.Entry], list[str], Report, dict[str, int]
+]:
     """Scrub one document. Raises rather than returning a partial result.
 
     Returns the scrubbed PDF, the form id, the fields replaced, vault entries for
-    values not already encrypted earlier in this batch, and any coverage
-    warnings from the content audit.
+    values not already encrypted earlier in this batch, any coverage warnings
+    from the content audit, and a per-type count of what the policy left behind.
     """
     pages = extract_lines(pdf_bytes)
     if page_count(pdf_bytes) > MAX_PAGES:
@@ -257,30 +287,75 @@ def scrub_one(
             # is encrypted.
             raise CoverageGap("; ".join(c.masked() for c in gaps))
 
+    allowed = _policy_types(policy)
     fields = _in_policy(located, policy)
+
+    # What the policy deliberately left readable. The detection layer cannot say
+    # this -- it runs against everything located, so a field excluded by policy
+    # reads to it as claimed -- and a narrowed policy must not look like a clean
+    # scrub. Counts only; the values themselves stay out of the report.
+    left_by_policy: dict[str, int] = {}
+    for located_field in located:
+        if located_field["pii_type"] not in allowed:
+            pii_type = located_field["pii_type"]
+            left_by_policy[pii_type] = left_by_policy.get(pii_type, 0) + 1
 
     values = [f["value"] for f in fields]
     assign(values, token_map)
+
+    # First spelling wins, matching the lookup this replaced.
+    type_by_value: dict[str, str] = {}
+    for f in fields:
+        type_by_value.setdefault(f["value"], f["pii_type"])
+
+    # What actually gets drawn on the page. Partial disclosure needs no change
+    # in ``redact``, which renders whatever a value maps to: the vault still
+    # stores the bare token, ``token_hashes`` still records it, and
+    # ``verify_tokens_present`` still finds it, because the token remains a
+    # literal prefix of the display form.
+    reveal = resolve_reveal(policy)
+    display_by_value = {
+        value: display(token_map[value], value, reveal.get(type_by_value[value], 0))
+        for value in dict.fromkeys(values)
+    }
 
     entries: list[vault.Entry] = []
     for value in dict.fromkeys(values):
         if value in encrypted:
             continue
-        pii_type = next(f["pii_type"] for f in fields if f["value"] == value)
+        pii_type = type_by_value[value]
         token = token_map[value]
         ciphertext, nonce = encrypt(job_key, value, aad(job_id, pii_type, token))
         entries.append(vault.Entry(token, pii_type, ciphertext, nonce))
         encrypted.add(value)
 
-    scrubbed = redact(pdf_bytes, fields, token_map)
+    scrubbed = redact(pdf_bytes, fields, display_by_value)
 
     # Hard gates. Nothing is released to the user unverified.
-    # Both directions matter: no original may survive, and every token must
-    # have landed -- a value removed without its token is unrecoverable.
+    # Three directions matter: no original may survive whole, every token must
+    # have landed -- a value removed without its token is unrecoverable -- and
+    # no value may show more of itself than the policy authorised. The third is
+    # not implied by the first: verify_scrubbed looks for whole values, so it
+    # passes cleanly over a page leaking every identifier's last six digits.
     verify_scrubbed(scrubbed, values)
     verify_tokens_present(scrubbed, {token_map[v] for v in values})
+    verify_disclosure(
+        scrubbed,
+        [
+            (token_map[value], value, reveal.get(type_by_value[value], 0))
+            for value in dict.fromkeys(values)
+        ],
+    )
 
-    return scrubbed, field_map["form_id"], fields, entries, warnings, report
+    return (
+        scrubbed,
+        field_map["form_id"],
+        fields,
+        entries,
+        warnings,
+        report,
+        left_by_policy,
+    )
 
 
 def scrub_batch(
@@ -294,6 +369,12 @@ def scrub_batch(
     field_maps = field_maps if field_maps is not None else load_field_maps()
     accept_batch(files)
 
+    # Resolve the policy before a job row exists. A bad type name or an
+    # out-of-range reveal count is a configuration error for the whole batch,
+    # not a per-document one, and failing here leaves nothing half written.
+    _policy_types(policy)
+    resolve_reveal(policy)
+
     job_key = generate_data_key()
     job_id = vault.create_job(conn, policy)
     vault.store_key(conn, job_id, wrap(job_key))
@@ -304,7 +385,15 @@ def scrub_batch(
 
     for filename, pdf_bytes in files:
         try:
-            scrubbed, form_id, fields, entries, warnings, report = scrub_one(
+            (
+                scrubbed,
+                form_id,
+                fields,
+                entries,
+                warnings,
+                report,
+                left_by_policy,
+            ) = scrub_one(
                 pdf_bytes, job_id, job_key, token_map, encrypted, policy, field_maps
             )
         except QUARANTINE_ERRORS as exc:
@@ -335,6 +424,7 @@ def scrub_batch(
                 pdf_bytes=scrubbed,
                 warnings=warnings,
                 candidates=report.unclaimed,
+                left_by_policy=left_by_policy,
             )
         )
 

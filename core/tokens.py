@@ -19,6 +19,55 @@ LENGTH = 8
 
 TOKEN_RE = re.compile(rf"\b{re.escape(PREFIX)}[{ALPHABET}]{{{LENGTH}}}\b")
 
+# The separator between a token and a revealed digit run. It must be a non-word
+# character. TOKEN_RE ends in a word boundary, so appending digits straight to
+# the token -- "PII-ABC234566789" -- destroys that boundary and find_tokens
+# returns nothing, leaving the document unidentifiable and every restore
+# unmatched. test_find_tokens_ignores_near_misses pins it.
+SUFFIX_SEP = "-"
+
+# Six leaves three digits of a nine-digit SSN or EIN hidden: a thousand
+# combinations, and fewer in practice, because the hidden leading run of a
+# pre-2011 SSN is a geographically assigned area number. Past this the setting
+# is not partial disclosure any more, so the range stops here.
+MAX_REVEAL_DIGITS = 6
+DEFAULT_REVEAL_DIGITS = 4
+
+
+def digits_of(value: str) -> str:
+    """The digits of a value, in order. ``512-44-8890`` -> ``512448890``."""
+    return "".join(c for c in value if c.isdigit())
+
+
+def display(token: str, value: str, reveal: int = 0) -> str:
+    """The text drawn on the page in place of ``value``.
+
+    Falls back to the bare token when nothing is revealed, and when the value
+    has no more digits than the policy would show: revealing every digit is not
+    redaction, and ``verify_scrubbed`` would refuse the document anyway.
+    """
+    if reveal <= 0:
+        return token
+    tail = digits_of(value)
+    if len(tail) <= reveal:
+        return token
+    return f"{token}{SUFFIX_SEP}{tail[-reveal:]}"
+
+
+def display_candidates(token: str, value: str) -> list[str]:
+    """Every form ``token`` might wear on a page, longest first.
+
+    Restore searches these in order rather than being told the job's policy. By
+    then it holds the decrypted value, so it can reconstruct what was drawn, and
+    a document mixing reveal counts across types still resolves.
+
+    The ordering is load-bearing: matching a six-digit tail as a four-digit one
+    would leave two digits stranded outside the removal box.
+    """
+    forms = [display(token, value, n) for n in range(MAX_REVEAL_DIGITS, 0, -1)]
+    return list(dict.fromkeys([f for f in forms if f != token] + [token]))
+
+
 
 def mint_token(taken: set[str] | None = None) -> str:
     """Return a fresh token, avoiding any already issued for this job.

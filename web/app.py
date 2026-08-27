@@ -23,7 +23,16 @@ from fastapi.templating import Jinja2Templates
 
 from core import vault
 from core.keys import MissingKeyMaterial, unwrap
-from core.pipeline import BatchTooLarge, NotAPdf, restore_batch, scrub_batch
+from core.piitypes import canonical
+from core.pipeline import (
+    DEFAULT_POLICY,
+    BatchTooLarge,
+    NotAPdf,
+    restore_batch,
+    scrub_batch,
+)
+from core.tokens import MAX_REVEAL_DIGITS
+from detect.policy import resolve_reveal
 
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = os.environ.get("PII_VAULT_DB", "vault.db")
@@ -32,6 +41,17 @@ DB_PATH = os.environ.get("PII_VAULT_DB", "vault.db")
 # downloads them. In memory, short lived, and never on disk.
 DOWNLOAD_TTL_SECONDS = 900
 MAX_PENDING_DOWNLOADS = 32
+
+# The scrub form's policy controls. Only the types a field map can actually
+# describe are offered: PHONE and DOB exist in the vocabulary for detection, and
+# a policy naming only those would match no field and quarantine the batch.
+POLICY_ROWS = [
+    {"type": "EIN", "field": "A — partnership employer identification number", "digits": True},
+    {"type": "SSN", "field": "E — partner's SSN or TIN", "digits": True},
+    {"type": "ITIN", "field": "E — partner's ITIN, where one is used instead", "digits": True},
+    {"type": "ADDRESS", "field": "B and F — street, city, state and ZIP", "digits": False},
+]
+REVEAL_CHOICES = list(range(2, MAX_REVEAL_DIGITS + 1))
 
 app = FastAPI(title="PII Scrubber")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -68,25 +88,98 @@ async def _read_uploads(uploads: list[UploadFile]) -> list[tuple[str, bytes]]:
     return [(u.filename or "unnamed.pdf", await u.read()) for u in uploads if u.filename]
 
 
+def _parse_reveal(pairs: list[str]) -> dict[str, int]:
+    """Read the ``TYPE=N`` values the reveal selects submit.
+
+    The same shape the CLI's ``--reveal`` takes. Kept as four lines in each
+    place rather than shared: the string form is a transport detail of two
+    interfaces, not something the policy layer should know about.
+    """
+    digits: dict[str, int] = {}
+    for pair in pairs:
+        name, separator, count = pair.partition("=")
+        if not separator or not count.isdigit():
+            raise ValueError(f"Unreadable disclosure setting: {pair!r}")
+        digits[canonical(name.strip().upper())] = int(count)
+    return digits
+
+
+def _build_policy(pii_types: list[str], reveal: list[str]) -> dict:
+    """Turn the submitted form into a policy, or raise for the 400.
+
+    Raises:
+        ValueError: for an empty selection, an unknown type or an out-of-range
+            count. ``resolve_reveal`` is called here rather than left to
+            ``scrub_batch`` so a bad form is a 400 the user can fix, not a 500.
+    """
+    chosen = [canonical(t.strip().upper()) for t in pii_types]
+    if not chosen:
+        raise ValueError(
+            "Choose at least one type to tokenise. A policy matching nothing "
+            "would return every document unchanged."
+        )
+    policy = {"pii_types": chosen, "reveal_digits": _parse_reveal(reveal)}
+    resolve_reveal(policy)
+    return policy
+
+
+def _safe_reveal(pairs: list[str]) -> dict[str, int]:
+    """Best-effort parse for re-rendering a form that was already rejected."""
+    try:
+        return _parse_reveal(pairs)
+    except ValueError:
+        return {}
+
+
+def _form_context(
+    chosen: list[str] | None = None, reveal: dict[str, int] | None = None
+) -> dict:
+    """Context for the scrub form, so a rejected submission keeps its settings."""
+    return {
+        "rows": POLICY_ROWS,
+        "reveal_choices": REVEAL_CHOICES,
+        "chosen": set(chosen if chosen is not None else DEFAULT_POLICY["pii_types"]),
+        "reveal": reveal or {},
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
-    return templates.TemplateResponse(request, "scrub.html", {})
+    return templates.TemplateResponse(request, "scrub.html", _form_context())
 
 
 @app.post("/scrub", response_class=HTMLResponse)
-async def scrub(request: Request, files: list[UploadFile]):
+async def scrub(
+    request: Request,
+    files: list[UploadFile],
+    policy_form: str = Form(default=""),
+    pii_types: list[str] = Form(default=[]),
+    reveal: list[str] = Form(default=[]),
+):
+    def rejected(message: str, status: int):
+        # Re-render with the settings intact. Losing them on a rejected upload
+        # invites the user to re-tick from memory and get it wrong.
+        chosen = pii_types if policy_form else None
+        context = {**_form_context(chosen, _safe_reveal(reveal)), "error": message}
+        return templates.TemplateResponse(request, "scrub.html", context, status_code=status)
+
+    # An absent marker means the client sent no policy at all, which takes the
+    # shipped default. Only a submitted-but-empty selection is an error: the
+    # form always carries the marker, so unticking everything is a real choice
+    # rather than a client that never knew about the controls.
+    try:
+        policy = _build_policy(pii_types, reveal) if policy_form else dict(DEFAULT_POLICY)
+    except ValueError as exc:
+        return rejected(str(exc), 400)
+
     payloads = await _read_uploads(files)
     conn = _db()
     try:
-        result = scrub_batch(conn, payloads)
+        result = scrub_batch(conn, payloads, policy=policy)
     except (BatchTooLarge, NotAPdf) as exc:
-        return templates.TemplateResponse(
-            request, "scrub.html", {"error": str(exc)}, status_code=400
-        )
+        return rejected(str(exc), 400)
     except MissingKeyMaterial as exc:
-        return templates.TemplateResponse(
-            request, "scrub.html", {"error": f"Server not configured: {exc}"}, status_code=500
-        )
+        return rejected(f"Server not configured: {exc}", 500)
     finally:
         conn.close()
 
@@ -96,7 +189,9 @@ async def scrub(request: Request, files: list[UploadFile]):
         download = _stash(f"scrubbed-{result.job_id[:8]}.zip", archive)
 
     return templates.TemplateResponse(
-        request, "scrub_result.html", {"result": result, "download": download}
+        request,
+        "scrub_result.html",
+        {"result": result, "download": download, "policy": policy},
     )
 
 

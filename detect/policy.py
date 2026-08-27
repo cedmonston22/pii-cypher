@@ -17,12 +17,21 @@ from __future__ import annotations
 from typing import Any, TypedDict
 
 from core.piitypes import PII_TYPES, canonical
+from core.tokens import MAX_REVEAL_DIGITS
 
-__all__ = ["DEFAULT_TYPES", "FLOOR", "Policy", "resolve", "auto_release"]
+__all__ = [
+    "DEFAULT_TYPES",
+    "FLOOR",
+    "Policy",
+    "resolve",
+    "resolve_reveal",
+    "auto_release",
+]
 
 
 class Policy(TypedDict, total=False):
     pii_types: list[str]
+    reveal_digits: dict[str, int]
     thresholds: dict[str, str]
     auto_release_types: list[str]
     quarantine_on_gap: bool
@@ -51,6 +60,34 @@ def resolve(policy: dict[str, Any] | None) -> frozenset[str]:
         return DEFAULT_TYPES | FLOOR
     chosen = {canonical(name) for name in policy["pii_types"]}
     return frozenset(chosen | FLOOR)
+
+
+def resolve_reveal(policy: dict[str, Any] | None) -> dict[str, int]:
+    """How many trailing digits each type may show on the page.
+
+    A type absent from the mapping, or set to zero, reveals nothing -- which is
+    what every job written before this setting existed did, so an old policy
+    read back means the same thing it always did.
+
+    Raises:
+        UnknownPiiType: for a name outside the vocabulary.
+        ValueError: for a count outside the range. Refused rather than clamped:
+            quietly showing four digits when six were configured is exactly the
+            gap between stated and actual policy this module exists to close.
+    """
+    if policy is None:
+        return {}
+    resolved: dict[str, int] = {}
+    for name, count in (policy.get("reveal_digits") or {}).items():
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise ValueError(f"reveal_digits[{name!r}] must be an integer, got {count!r}")
+        if not 0 <= count <= MAX_REVEAL_DIGITS:
+            raise ValueError(
+                f"reveal_digits[{name!r}] is {count}; the range is 0 to {MAX_REVEAL_DIGITS}"
+            )
+        if count:
+            resolved[canonical(name)] = count
+    return resolved
 
 
 def auto_release(policy: dict[str, Any] | None) -> frozenset[str]:

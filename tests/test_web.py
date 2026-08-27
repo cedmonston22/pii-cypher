@@ -205,3 +205,88 @@ def test_the_review_screen_shows_why_a_value_was_flagged(client, k1_2025_bytes, 
     assert "SSN" in html
     assert "validator:SSN" in html, "the evidence must reach the screen"
     assert "high" in html
+
+
+# --------------------------------------------------------------------------
+# the policy controls on the scrub form
+# --------------------------------------------------------------------------
+
+
+def _policy_form(types=("SSN", "ITIN", "EIN", "ADDRESS"), **reveal):
+    """The fields the scrub form submits. Selects always send TYPE=N."""
+    return {
+        "policy_form": "1",
+        "pii_types": list(types),
+        "reveal": [f"{t}={n}" for t, n in reveal.items()],
+    }
+
+
+def _scrubbed_text(client, k1_bytes, data):
+    response = client.post("/scrub", files=[_upload("k1.pdf", k1_bytes)], data=data)
+    assert response.status_code == 200, response.text
+    archive = client.get(f"/download/{_download_token(response.text)}")
+    return response.text, extract_all_text(_zip_members(archive.content)["k1.pdf"])
+
+
+def test_the_form_offers_the_policy_controls(client):
+    html = client.get("/").text
+    assert 'name="pii_types"' in html
+    assert 'name="reveal"' in html
+    assert 'value="SSN=6"' in html, "the full range must be reachable"
+    assert 'value="ADDRESS=4"' not in html, "an address has no last digits"
+
+
+def test_an_unticked_type_is_left_and_reported(client, k1_bytes):
+    """The green result must not hide an identifier the policy let through."""
+    html, text = _scrubbed_text(client, k1_bytes, _policy_form(types=["EIN", "ADDRESS"]))
+
+    assert "000-00-0000" in text, "the unticked SSN stays on the document"
+    assert "Left readable by your policy" in html
+    assert "SSN" in html
+
+
+def test_a_revealed_tail_reaches_the_page(client, k1_bytes):
+    html, text = _scrubbed_text(client, k1_bytes, _policy_form(SSN=4))
+
+    assert "000-00-0000" not in text, "the whole value must still be gone"
+    assert "-0000" in text, "the authorised tail must be readable"
+    assert "The last <strong>4</strong> digits" in html
+
+
+def test_unticking_everything_is_refused_not_defaulted(client, k1_bytes):
+    """Silently applying the default would ignore what the user asked for."""
+    response = client.post(
+        "/scrub", files=[_upload("k1.pdf", k1_bytes)], data=_policy_form(types=[])
+    )
+    assert response.status_code == 400
+    assert "at least one type" in response.text
+
+
+def test_a_count_outside_the_range_is_a_400_not_a_500(client, k1_bytes):
+    response = client.post(
+        "/scrub", files=[_upload("k1.pdf", k1_bytes)], data=_policy_form(SSN=9)
+    )
+    assert response.status_code == 400
+    assert "range is 0 to 6" in response.text
+
+
+def test_a_rejected_submission_keeps_its_settings(client):
+    """Re-ticking from memory is how the wrong policy gets submitted twice."""
+    response = client.post(
+        "/scrub", files=[_upload("bad.pdf", b"MZ not a pdf")], data=_policy_form(types=["EIN"], EIN=6)
+    )
+    assert response.status_code == 400
+
+    html = response.text
+    ein_box = html.index('value="EIN"')
+    assert "checked" in html[ein_box : ein_box + 120], "EIN must still be ticked"
+    ein_six = html.index('value="EIN=6"')
+    assert "selected" in html[ein_six : ein_six + 60], "and still set to 6"
+    assert 'value="SSN"' in html and "checked" not in html[html.index('value="SSN"') :][:100]
+
+
+def test_a_client_that_sends_no_policy_still_gets_the_default(client, k1_bytes):
+    """The endpoint predates the controls; an absent policy is not an empty one."""
+    _, text = _scrubbed_text(client, k1_bytes, None)
+    for value in K1_VALUES:
+        assert value not in text

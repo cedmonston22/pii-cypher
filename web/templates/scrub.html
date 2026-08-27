@@ -9,15 +9,63 @@ originals are encrypted under a key belonging to this batch.</p>
   <input id="files" type="file" name="files" accept="application/pdf" multiple required>
   <p class="hint">Up to 25 files, 10&nbsp;MB each, 50&nbsp;MB per batch, 20 pages per document.
   Processing is synchronous, so the batch is capped to keep the request responsive.</p>
+
+  <!-- Marks a submission as carrying policy controls. Without it an empty
+       pii_types means "the client sent no policy" rather than "the user
+       unticked everything", and only the second is an error. -->
+  <input type="hidden" name="policy_form" value="1">
+  <label>What to replace</label>
+  {% if not rows %}
+  {# An empty table is an unusable form that still looks finished. It means the
+     handler rendered this without _form_context -- most often a server running
+     older Python than the template on disk, since Jinja reloads and uvicorn
+     does not. Say so rather than showing four headers and no controls. #}
+  <div class="callout bad">
+    <strong>The policy controls did not load.</strong>
+    <p class="hint">This page is newer than the server process rendering it.
+    Restart the app and reload.</p>
+  </div>
+  {% endif %}
+  <table class="policy">
+    <tr>
+      <th>Type</th>
+      <th>Fields on the K-1</th>
+      <th class="pick">Tokenise</th>
+      <th class="pick">Show last</th>
+    </tr>
+    {% for row in rows %}
+    <tr>
+      <td><strong>{{ row.type }}</strong></td>
+      <td>{{ row.field }}</td>
+      <td class="pick">
+        <input type="checkbox" name="pii_types" value="{{ row.type }}"
+               aria-label="Tokenise {{ row.type }}"
+               {% if row.type in chosen %}checked{% endif %}>
+      </td>
+      <td class="pick">
+        {% if row.digits %}
+        <select name="reveal" aria-label="Digits of {{ row.type }} left readable">
+          <option value="{{ row.type }}=0">none</option>
+          {% for n in reveal_choices %}
+          <option value="{{ row.type }}={{ n }}"
+                  {% if reveal.get(row.type) == n %}selected{% endif %}>{{ n }}</option>
+          {% endfor %}
+        </select>
+        {% else %}
+        <span class="muted">&mdash;</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="hint">Names are deliberately out of policy and are left on the form.
+  Unticking a type leaves that identifier readable on the document; the result
+  page says so, and says how many.</p>
+  <p class="hint"><strong>Showing the last digits</strong> keeps a value matchable
+  by whoever receives the document, and the whole value is still recoverable on
+  restore. It is a real disclosure though: an SSN and an EIN are nine digits, so
+  showing six leaves only three hidden.</p>
+
   <button type="submit">Scrub batch</button>
 </form>
-
-<h2>What is replaced</h2>
-<table>
-  <tr><th>Type</th><th>Fields on the K-1</th></tr>
-  <tr><td>EIN</td><td>A &mdash; partnership employer identification number</td></tr>
-  <tr><td>SSN / TIN</td><td>E &mdash; partner's SSN or TIN</td></tr>
-  <tr><td>Address</td><td>B and F &mdash; street, city, state and ZIP</td></tr>
-</table>
-<p class="hint">Names are deliberately out of policy and are left on the form.</p>
 {% endblock %}

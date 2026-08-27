@@ -10,10 +10,54 @@ import argparse
 import sys
 import zipfile
 from pathlib import Path
+from typing import Any
 
 from core import vault
 from core.keys import MissingKeyMaterial, unwrap
-from core.pipeline import BatchTooLarge, NotAPdf, restore_batch, scrub_batch
+from core.piitypes import PII_TYPES, UnknownPiiType, canonical
+from core.pipeline import (
+    DEFAULT_POLICY,
+    BatchTooLarge,
+    NotAPdf,
+    PolicyMismatch,
+    restore_batch,
+    scrub_batch,
+)
+from core.tokens import MAX_REVEAL_DIGITS
+
+
+def _pii_type(text: str) -> str:
+    """Accept a type name in any case. argparse checks it against ``choices``."""
+    return text.strip().upper()
+
+
+def _reveal_pair(text: str) -> tuple[str, int]:
+    """Parse ``TYPE=N``.
+
+    Raises:
+        argparse.ArgumentTypeError: so a bad flag is a usage error rather than a
+            traceback. ``canonical`` raises ValueError, which argparse renders
+            the same way.
+    """
+    name, separator, count = text.partition("=")
+    if not separator or not count.isdigit():
+        raise argparse.ArgumentTypeError(f"expected TYPE=N, got {text!r}")
+    return canonical(_pii_type(name)), int(count)
+
+
+def _policy(args: argparse.Namespace) -> dict[str, Any]:
+    """Build a policy from the flags, starting from the shipped default.
+
+    Starting from the default matters: a bare ``--reveal EIN=4`` must not read
+    as "redact nothing but reveal an EIN", which is a policy matching no field
+    and quarantines the whole batch.
+    """
+    policy: dict[str, Any] = dict(DEFAULT_POLICY)
+    if args.pii_types is not None:
+        policy["pii_types"] = args.pii_types
+    if args.reveal:
+        policy["reveal_digits"] = dict(args.reveal)
+    return policy
 
 
 def _read(paths: list[str]) -> list[tuple[str, bytes]]:
@@ -28,17 +72,25 @@ def _write_zip(destination: Path, files: list[tuple[str, bytes]]) -> None:
 
 
 def cmd_scrub(args: argparse.Namespace) -> int:
+    policy = _policy(args)
     conn = vault.connect(args.db)
     try:
-        result = scrub_batch(conn, _read(args.files))
+        result = scrub_batch(conn, _read(args.files), policy=policy)
     finally:
         conn.close()
 
     print(f"job_id: {result.job_id}")
+    print(f"tokenising: {', '.join(sorted(policy['pii_types']))}")
+    for pii_type, count in sorted((policy.get("reveal_digits") or {}).items()):
+        if count:
+            print(f"  showing the last {count} digits of each {pii_type}")
+
     for doc in result.scrubbed:
         print(f"  scrubbed    {doc.filename}  ({doc.form_id}, {doc.replaced_count} replaced)")
         for warning in doc.warnings:
             print(f"      NOT REPLACED, looks like PII: {warning}")
+        for pii_type, count in sorted(doc.left_by_policy.items()):
+            print(f"      LEFT READABLE by policy: {count} x {pii_type}")
     for doc in result.quarantined:
         print(f"  QUARANTINED {doc.filename}  {doc.reason}")
 
@@ -51,6 +103,10 @@ def cmd_scrub(args: argparse.Namespace) -> int:
         return 1
     if any(d.warnings for d in result.scrubbed):
         print("\nSome PII-shaped text was not covered by the field map. See above.")
+        return 1
+    if any(d.left_by_policy for d in result.scrubbed):
+        print("\nSome identifiers stayed readable because the policy excluded"
+              " their type. See above.")
         return 1
     return 0
 
@@ -106,6 +162,21 @@ def build_parser() -> argparse.ArgumentParser:
     scrub = sub.add_parser("scrub", help="scrub a batch of PDFs")
     scrub.add_argument("files", nargs="+")
     scrub.add_argument("--out", default="scrubbed.zip")
+    scrub.add_argument(
+        "--pii-types",
+        nargs="+",
+        type=_pii_type,
+        choices=sorted(PII_TYPES),
+        default=None,
+        help="which types to tokenise (default: the shipped policy)",
+    )
+    scrub.add_argument(
+        "--reveal",
+        action="append",
+        type=_reveal_pair,
+        metavar="TYPE=N",
+        help=f"leave the last N digits of TYPE readable, 0 to {MAX_REVEAL_DIGITS}; repeatable",
+    )
     scrub.set_defaults(func=cmd_scrub)
 
     restore = sub.add_parser("restore", help="restore any subset of a job")
@@ -134,6 +205,11 @@ def main(argv: list[str] | None = None) -> int:
         print("set PII_MASTER_KEY and PII_LOOKUP_SECRET to base64 32-byte values", file=sys.stderr)
         return 2
     except (BatchTooLarge, NotAPdf, vault.JobNotFound, vault.JobExpired) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except (PolicyMismatch, UnknownPiiType, ValueError) as exc:
+        # A policy is wrong for the whole batch rather than for one document,
+        # so it is a usage error here, not a per-document quarantine.
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

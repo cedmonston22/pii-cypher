@@ -20,8 +20,8 @@ from core.pipeline import (
     restore_batch,
     scrub_batch,
 )
-from core.tokens import find_tokens
-from core.verify import extract_all_text
+from core.tokens import MAX_REVEAL_DIGITS, digits_of, find_tokens
+from core.verify import OverDisclosed, extract_all_text
 
 K1_VALUES = [
     "00-0000000",
@@ -540,7 +540,7 @@ def test_a_policy_matching_no_field_is_quarantined_not_reported_scrubbed(db, k1_
     value among no values, and no missing token among no tokens. The batch was
     reported as scrubbed while the document still carried every identifier.
     """
-    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["ssn_tin", "ein"]})
+    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["PHONE", "DOB"]})
 
     assert result.scrubbed == []
     assert len(result.quarantined) == 1
@@ -549,12 +549,42 @@ def test_a_policy_matching_no_field_is_quarantined_not_reported_scrubbed(db, k1_
 
 def test_the_mismatch_reason_names_both_vocabularies(db, k1_bytes):
     """The failure has to be self-explanatory: drift is invisible otherwise."""
-    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["ssn_tin"]})
+    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["PHONE"]})
 
     reason = result.quarantined[0].reason
-    assert "'ssn_tin'" in reason, "the reason must show what the policy asked for"
+    assert "'PHONE'" in reason, "the reason must show what the policy asked for"
     assert "'SSN'" in reason, "and what the map actually describes"
     assert "us-1065-k1" in reason
+
+
+def test_a_legacy_policy_spelling_means_what_it_always_meant(db, k1_bytes):
+    """Old policies are read back, so they must resolve rather than mismatch.
+
+    The vault still holds jobs written before the vocabulary was fixed, whose
+    stored policy says ``ssn_tin``. ``detect.policy.resolve`` has always
+    canonicalised those; the redaction filter now does too, so one policy dict
+    cannot mean two different things depending on which subsystem reads it.
+    """
+    legacy = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["ssn_tin", "ein"]})
+    canonical_ = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["SSN", "EIN"]})
+
+    assert legacy.quarantined == []
+    assert len(legacy.scrubbed) == 1
+    assert legacy.scrubbed[0].replaced_count == canonical_.scrubbed[0].replaced_count
+
+
+def test_an_unknown_policy_type_is_refused_before_a_job_is_written(db, k1_bytes):
+    """A typo must not read as a deliberately narrow policy.
+
+    Raised rather than quarantined: an unusable type name is wrong for the whole
+    batch, and failing before ``create_job`` leaves no half-written job behind.
+    """
+    from core.piitypes import UnknownPiiType
+
+    before = len(vault.list_jobs(db))
+    with pytest.raises(UnknownPiiType):
+        scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["SSNN"]})
+    assert len(vault.list_jobs(db)) == before
 
 
 def test_a_deliberately_narrow_policy_still_scrubs(db, k1_bytes):
@@ -672,3 +702,165 @@ def test_the_gate_leaves_no_vault_entries_behind(db, k1_2025_bytes):
         "SELECT COUNT(*) FROM vault_entries WHERE job_id = ?", (result.job_id,)
     ).fetchone()[0]
     assert rows == 0
+
+
+# --------------------------------------------------------------------------
+# partial disclosure -- a revealed digit run, still fully reversible
+# --------------------------------------------------------------------------
+
+REVEAL_IDS = ["00-0000000", "000-00-0000"]
+
+
+def _reveal(n, types=("SSN", "EIN")):
+    return {**DEFAULT_POLICY, "reveal_digits": {t: n for t in types}}
+
+
+@pytest.mark.parametrize("n", [2, 4, 6])
+def test_exactly_the_authorised_digits_are_readable(db, k1_bytes, n):
+    """The whole value must go, and no more than n digits may come back."""
+    doc = scrub_batch(db, [("k1.pdf", k1_bytes)], policy=_reveal(n)).scrubbed[0]
+    text = extract_all_text(doc.pdf_bytes)
+
+    for value in REVEAL_IDS:
+        tail = digits_of(value)
+        assert value not in text, "the whole value must still be gone"
+        assert f"-{tail[-n:]}" in text, "the authorised run must be readable"
+        assert f"-{tail[-(n + 1):]}" not in text, "and not one digit more"
+
+
+@pytest.mark.parametrize("n", [2, 4, 6])
+def test_a_revealed_document_restores_pixel_identically(db, k1_bytes, n):
+    """The gate that catches a stranded digit run.
+
+    ``search_for`` returns only the needle's glyphs, so restoring by the bare
+    token leaves the revealed run outside the removal box, alive through
+    ``apply_redactions`` and overprinting the restored value. Every text-based
+    assertion passes while the page reads ``000-00-0000 -0000``; only rendering
+    catches it. Parametrised because matching a six-digit tail as a four-digit
+    one strands two digits the same way.
+    """
+    batch = scrub_batch(db, [("k1.pdf", k1_bytes)], policy=_reveal(n))
+    restored = restore_batch(
+        db, [("k1.pdf", batch.scrubbed[0].pdf_bytes)], batch.job_id
+    ).restored[0]
+
+    assert restored.unresolved == []
+    assert restored.tokens_resolved == restored.tokens_found
+
+    before = pymupdf.open(stream=k1_bytes, filetype="pdf")[0].get_pixmap(dpi=150)
+    after = pymupdf.open(stream=restored.pdf_bytes, filetype="pdf")[0].get_pixmap(dpi=150)
+    assert (before.width, before.height) == (after.width, after.height)
+    assert before.samples == after.samples, "restored page does not render identically"
+
+
+def test_reveal_leaves_the_vault_and_the_token_untouched(db, k1_bytes):
+    """Disclosure is a drawing concern only. Everything else must be unchanged."""
+    plain = scrub_batch(db, [("a.pdf", k1_bytes)]).scrubbed[0]
+    revealed = scrub_batch(db, [("b.pdf", k1_bytes)], policy=_reveal(4)).scrubbed[0]
+
+    assert revealed.replaced_count == plain.replaced_count
+    # The bare token still stands alone in the vault and on the page.
+    assert len(find_tokens(extract_lines(revealed.pdf_bytes))) == len(
+        find_tokens(extract_lines(plain.pdf_bytes))
+    )
+
+
+def test_a_type_outside_reveal_shows_nothing(db, k1_bytes):
+    """Revealing an EIN must not quietly reveal the SSN beside it."""
+    doc = scrub_batch(db, [("k1.pdf", k1_bytes)], policy=_reveal(4, ("EIN",))).scrubbed[0]
+    text = extract_all_text(doc.pdf_bytes)
+
+    assert "-0000" in text, "the EIN tail is authorised"
+    assert text.count("-0000") == 1, "and the SSN's is not"
+
+
+def test_a_value_with_too_few_digits_is_not_revealed():
+    """Showing every digit is not redaction. Fall back to the bare token."""
+    from core.tokens import display
+
+    assert display("PII-ABC23456", "12-34", 4) == "PII-ABC23456"
+    assert display("PII-ABC23456", "1234", 4) == "PII-ABC23456"
+    assert display("PII-ABC23456", "12345", 4) == "PII-ABC23456-2345"
+
+
+def test_a_count_outside_the_range_is_refused(db, k1_bytes):
+    """Refused, not clamped: showing four when six was configured is drift."""
+    before = len(vault.list_jobs(db))
+    with pytest.raises(ValueError, match="range is 0 to"):
+        scrub_batch(db, [("k1.pdf", k1_bytes)], policy=_reveal(MAX_REVEAL_DIGITS + 1))
+    assert len(vault.list_jobs(db)) == before, "no job may be written for a bad policy"
+
+
+def test_over_disclosure_quarantines_rather_than_ships(db, k1_bytes, monkeypatch):
+    """The gate is load-bearing, so prove it fires rather than trusting redact.
+
+    ``verify_scrubbed`` looks for whole values and passes cleanly over a page
+    leaking six digits of every identifier, so this is the only thing standing
+    between a drawing bug and a disclosure.
+    """
+    import core.pipeline as pipeline
+
+    monkeypatch.setattr(
+        pipeline, "display", lambda token, value, reveal: f"{token}-{digits_of(value)[-6:]}"
+    )
+    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy=_reveal(2))
+
+    assert result.scrubbed == []
+    assert "OverDisclosed" in result.quarantined[0].reason
+
+
+def test_the_disclosure_reason_carries_no_digits(db, k1_bytes, monkeypatch):
+    """documents.reason is plaintext while the filename beside it is encrypted."""
+    import core.pipeline as pipeline
+
+    monkeypatch.setattr(
+        pipeline, "display", lambda token, value, reveal: f"{token}-{digits_of(value)[-6:]}"
+    )
+    reason = scrub_batch(db, [("k1.pdf", k1_bytes)], policy=_reveal(2)).quarantined[0].reason
+
+    for value in REVEAL_IDS:
+        assert digits_of(value)[-6:] not in reason
+
+
+@pytest.mark.parametrize("n", [4, 6])
+def test_a_revealed_tail_is_not_read_back_as_fresh_pii(db, k1_2025_bytes, n):
+    """The tool's own output must not look like PII to the tool.
+
+    A revealed run is a digit sequence sitting next to a token, which is exactly
+    the shape the pattern layer hunts for. Scrubbing an already-scrubbed
+    document is the cheapest way to prove the token exclusion still covers the
+    whole display form and not just the token.
+    """
+    policy = {**DEFAULT_POLICY, "reveal_digits": {"SSN": n, "EIN": n}}
+    once = scrub_batch(db, [("a.pdf", k1_2025_bytes)], policy=policy).scrubbed[0]
+    twice = scrub_batch(db, [("b.pdf", once.pdf_bytes)], policy=policy)
+
+    assert twice.quarantined == []
+    assert twice.scrubbed[0].warnings == []
+    assert twice.scrubbed[0].candidates == ()
+
+
+# --------------------------------------------------------------------------
+# what the policy deliberately left behind
+# --------------------------------------------------------------------------
+
+
+def test_an_excluded_type_is_reported_not_silently_left(db, k1_bytes):
+    """Unticking a type must not read as a clean scrub.
+
+    Detection runs against everything located, before the policy filter, so an
+    excluded field reads to it as claimed and raises no warning. Without this
+    count the result screen is green over a document that still carries its SSN.
+    """
+    doc = scrub_batch(
+        db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["EIN", "ADDRESS"]}
+    ).scrubbed[0]
+
+    assert "000-00-0000" in extract_all_text(doc.pdf_bytes)
+    assert doc.left_by_policy == {"SSN": 1}
+    assert doc.warnings == [], "this is a policy choice, not a detection failure"
+
+
+def test_nothing_is_left_behind_under_the_default_policy(db, k1_bytes):
+    doc = scrub_batch(db, [("k1.pdf", k1_bytes)]).scrubbed[0]
+    assert doc.left_by_policy == {}
