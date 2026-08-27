@@ -540,7 +540,7 @@ def test_a_policy_matching_no_field_is_quarantined_not_reported_scrubbed(db, k1_
     value among no values, and no missing token among no tokens. The batch was
     reported as scrubbed while the document still carried every identifier.
     """
-    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["SSN", "EIN"]})
+    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["ssn_tin", "ein"]})
 
     assert result.scrubbed == []
     assert len(result.quarantined) == 1
@@ -549,17 +549,17 @@ def test_a_policy_matching_no_field_is_quarantined_not_reported_scrubbed(db, k1_
 
 def test_the_mismatch_reason_names_both_vocabularies(db, k1_bytes):
     """The failure has to be self-explanatory: drift is invisible otherwise."""
-    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["SSN"]})
+    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["ssn_tin"]})
 
     reason = result.quarantined[0].reason
-    assert "'SSN'" in reason, "the reason must show what the policy asked for"
-    assert "'ssn_tin'" in reason, "and what the map actually describes"
+    assert "'ssn_tin'" in reason, "the reason must show what the policy asked for"
+    assert "'SSN'" in reason, "and what the map actually describes"
     assert "us-1065-k1" in reason
 
 
 def test_a_deliberately_narrow_policy_still_scrubs(db, k1_bytes):
     """Sharing one type is enough. Narrow is not the same as mismatched."""
-    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["ein"]})
+    result = scrub_batch(db, [("k1.pdf", k1_bytes)], policy={"pii_types": ["EIN"]})
 
     assert len(result.scrubbed) == 1
     doc = result.scrubbed[0]

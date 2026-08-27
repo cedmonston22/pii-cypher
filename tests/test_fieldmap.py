@@ -6,10 +6,12 @@ their label, 2025 puts them flush and the numeric fields 1.8pt to the left.
 """
 
 import copy
+import json
 
 import pytest
 
 from core.extract import extract_lines
+from core.piitypes import PII_TYPES, UnknownPiiType
 from core.fieldmap import (
     MAX_FIELD_LINES,
     AnchorMismatch,
@@ -315,3 +317,55 @@ def test_propagate_catches_a_repeated_value(both, maps):
     grown = propagate(extra, located)
     assert len(grown) == len(located) + 1
     assert sum(1 for f in grown if f["value"] == "000-00-0000") == 2
+
+
+def test_the_loader_canonicalises_legacy_type_names(tmp_path):
+    """A map written in the old vocabulary still loads, spelled the new way.
+
+    The loader is the only boundary a legacy spelling can cross. Translating
+    any deeper in would leave two vocabularies alive inside core with a
+    conversion at every comparison, and a missed one redacts nothing silently.
+    """
+    (tmp_path / "legacy.json").write_text(
+        json.dumps(
+            {
+                "form_id": "legacy",
+                "identify": {"all_of": ["marker"]},
+                "fields": [
+                    {"name": "a", "pii_type": "ssn_tin", "keywords": "ssn"},
+                    {"name": "b", "pii_type": "address", "keywords": "addr"},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_field_maps(tmp_path)[0]
+
+    assert [f["pii_type"] for f in loaded["fields"]] == ["SSN", "ADDRESS"]
+
+
+def test_a_map_naming_an_unknown_type_is_refused(tmp_path):
+    """An unrecognised type matches no policy, so the field is filtered out and
+    the document is returned unredacted with every release gate satisfied.
+    Refusing the map is the only way that failure stays visible.
+    """
+    (tmp_path / "bad.json").write_text(
+        json.dumps(
+            {
+                "form_id": "bad",
+                "identify": {"all_of": ["marker"]},
+                "fields": [{"name": "a", "pii_type": "passport", "keywords": "k"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(UnknownPiiType, match="passport"):
+        load_field_maps(tmp_path)
+
+
+def test_the_shipped_map_uses_the_canonical_vocabulary():
+    """Guards against the shipped map drifting back out of the vocabulary."""
+    for field in load_field_maps()[0]["fields"]:
+        assert field["pii_type"] in PII_TYPES

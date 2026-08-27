@@ -26,7 +26,7 @@ from core.vault import (
     store_key,
 )
 
-POLICY = {"pii_types": ["ein", "ssn_tin", "address"]}
+POLICY = {"pii_types": ["EIN", "SSN", "ADDRESS"]}
 
 
 @pytest.fixture

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, TypedDict
 
 from core.extract import Line
+from core.piitypes import canonical
 
 FORMS_DIR = Path(__file__).resolve().parent.parent / "forms"
 
@@ -77,10 +78,19 @@ def normalize(text: str) -> str:
 
 
 def load_field_maps(forms_dir: Path | None = None) -> list[dict[str, Any]]:
+    """Load and validate every field map, canonicalising its type names.
+
+    Canonicalisation happens here because this is the only boundary a legacy
+    spelling can cross -- a map written before the vocabulary was fixed, or one
+    supplied by a third party. Translating anywhere further in would leave two
+    vocabularies alive inside ``core`` with a conversion at every comparison.
+    """
     directory = forms_dir or FORMS_DIR
     maps = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(directory.glob("*.json"))]
     for field_map in maps:
         _validate(field_map)
+        for field in field_map["fields"]:
+            field["pii_type"] = canonical(field["pii_type"])
     return maps
 
 
@@ -96,6 +106,10 @@ def _validate(field_map: dict[str, Any]) -> None:
                 raise ValueError(f"field {field.get('name')!r} missing {key!r}")
         if field.get("skip_lines", 0) < 0:
             raise ValueError(f"field {field['name']!r} has a negative skip_lines")
+        # An unrecognised type is silent damage: it matches no policy, so the
+        # field is filtered out and the document is returned unredacted with
+        # every release gate satisfied. Refuse the map instead.
+        canonical(field["pii_type"])
 
 
 def identify(pages: list[list[Line]], field_maps: list[dict[str, Any]]) -> dict[str, Any]:

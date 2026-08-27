@@ -32,7 +32,7 @@ def _page_with(
 
     found = pymupdf.open(stream=data, filetype="pdf")[0].search_for(text)[0]
     field = Field(
-        name="f", pii_type="ssn_tin", value=text, page=1,
+        name="f", pii_type="SSN", value=text, page=1,
         bbox=(found.x0, found.y0, found.x1, found.y1),
         fontname=fontname, size=fontsize,
     )
@@ -194,7 +194,7 @@ def test_redaction_leaves_neighbouring_text_alone():
 
     found = pymupdf.open(stream=data, filetype="pdf")[0].search_for("000-00-0000")[0]
     field = Field(
-        name="f", pii_type="ssn_tin", value="000-00-0000", page=1,
+        name="f", pii_type="SSN", value="000-00-0000", page=1,
         bbox=(found.x0, found.y0, found.x1, found.y1),
     )
     out = redact(data, [field], {"000-00-0000": TOKEN})

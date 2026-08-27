@@ -7,23 +7,23 @@
   "fields": [
     {
       "name": "partnership_ein",
-      "pii_type": "ein",
+      "pii_type": "EIN",
       "keywords": "employer identification number"
     },
     {
       "name": "partnership_address",
-      "pii_type": "address",
+      "pii_type": "ADDRESS",
       "keywords": "name address city state and zip code",
       "skip_lines": 1
     },
     {
       "name": "partner_tin",
-      "pii_type": "ssn_tin",
+      "pii_type": "SSN",
       "keywords": "ssn or tin"
     },
     {
       "name": "partner_address",
-      "pii_type": "address",
+      "pii_type": "ADDRESS",
       "keywords": "zip code for partner",
       "skip_lines": 1
     }

@@ -53,9 +53,9 @@ unreadable file is quarantined and the rest of the batch continues.
 
 | Type | Fields on the K-1 |
 |---|---|
-| `ein` | A — partnership employer identification number |
-| `ssn_tin` | E — partner's SSN or TIN |
-| `address` | B and F — street, city, state and ZIP |
+| `EIN` | A — partnership employer identification number |
+| `SSN` | E — partner's SSN or TIN |
+| `ADDRESS` | B and F — street, city, state and ZIP |
 
 Names are deliberately out of policy and stay on the form. `skip_lines: 1` drops the
 first line of each address box, which is the name.
@@ -89,7 +89,7 @@ knows the batch. Nothing requires them.
 no coordinates:
 
 ```json
-{ "name": "partner_tin", "pii_type": "ssn_tin", "keywords": "ssn or tin" }
+{ "name": "partner_tin", "pii_type": "SSN", "keywords": "ssn or tin" }
 ```
 
 This matters because form geometry is not stable. Between the 2021 and 2025

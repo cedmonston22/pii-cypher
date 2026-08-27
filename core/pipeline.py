@@ -45,7 +45,7 @@ MAX_BATCH_BYTES = 50 * 1024 * 1024
 MAX_PAGES = 20
 PDF_MAGIC = b"%PDF"
 
-DEFAULT_POLICY: dict[str, Any] = {"pii_types": ["ein", "ssn_tin", "address"]}
+DEFAULT_POLICY: dict[str, Any] = {"pii_types": ["SSN", "ITIN", "EIN", "ADDRESS"]}
 
 # A document must share this fraction of its tokens with an upload to be
 # considered the same document. Below it, ask the user rather than guess.
@@ -63,7 +63,7 @@ class PolicyMismatch(Exception):
 
     Two vocabularies drifting apart is the way this happens in practice: a field
     map saying ``ssn_tin`` against a policy saying ``SSN``. Deliberately narrow
-    policies are unaffected -- ``{"pii_types": ["ein"]}`` against a map that
+    policies are unaffected -- ``{"pii_types": ["EIN"]}`` against a map that
     describes an EIN shares a type and passes.
     """
 
