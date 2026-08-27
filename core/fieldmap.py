@@ -100,6 +100,15 @@ def _validate(field_map: dict[str, Any]) -> None:
             raise ValueError(f"field map missing {key!r}")
     if not field_map["identify"].get("all_of"):
         raise ValueError(f"{field_map['form_id']!r} has no identify.all_of markers")
+    # Labels whose boxes are known not to carry PII -- the IRS service centre on
+    # a K-1 is filled-in text, in the label column, that no field claims. It is
+    # deliberately NOT checked by verify_labels: a missing ignore label costs
+    # one box of suppression, while a missing *field* label is a quarantine.
+    if not isinstance(field_map.get("ignore", []), list):
+        raise ValueError(f"{field_map['form_id']!r} has a non-list ignore")
+    for keywords in field_map.get("ignore", []):
+        if not isinstance(keywords, str) or not keywords.strip():
+            raise ValueError(f"{field_map['form_id']!r} has an empty ignore entry")
     for field in field_map["fields"]:
         for key in ("name", "pii_type", "keywords"):
             if key not in field:

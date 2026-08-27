@@ -369,3 +369,52 @@ def test_the_shipped_map_uses_the_canonical_vocabulary():
     """Guards against the shipped map drifting back out of the vocabulary."""
     for field in load_field_maps()[0]["fields"]:
         assert field["pii_type"] in PII_TYPES
+
+
+def test_an_ignore_label_resolves_to_the_box_that_is_not_pii(k1_bytes):
+    """The IRS service centre is filled-in text no field claims.
+
+    It is stylistically identical to the addresses and sits in the label
+    column, so a coverage check keyed on style would report it on every clean
+    document. Naming the label is the only way to say "known, and not PII"
+    without guessing at content.
+    """
+    pages = extract_lines(k1_bytes)
+    field_map = load_field_maps()[0]
+
+    label = find_label(pages, field_map["ignore"][0])
+    assert label is not None
+
+    box = discover_field(pages, label, field_map.get("col_tol", 90.0))
+    assert [line["text"] for line in box] == ["OGDEN, UT"]
+
+
+def test_a_missing_ignore_label_is_not_an_anchor_mismatch(k1_bytes):
+    """An absent ignore costs one box of suppression; an absent field is fatal.
+
+    verify_labels must keep iterating fields alone, or a form revision that
+    reworded a non-PII label would quarantine documents it has no business
+    rejecting.
+    """
+    pages = extract_lines(k1_bytes)
+    field_map = copy.deepcopy(load_field_maps()[0])
+    field_map["ignore"] = ["a label this form does not have"]
+
+    verify_labels(pages, field_map)  # must not raise
+
+
+def test_a_malformed_ignore_is_refused(tmp_path):
+    (tmp_path / "bad.json").write_text(
+        json.dumps(
+            {
+                "form_id": "bad",
+                "identify": {"all_of": ["marker"]},
+                "ignore": ["  "],
+                "fields": [{"name": "a", "pii_type": "SSN", "keywords": "k"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="ignore"):
+        load_field_maps(tmp_path)

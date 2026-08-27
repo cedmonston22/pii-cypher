@@ -4,6 +4,7 @@
     "all_of": ["schedule k 1", "form 1065"]
   },
   "col_tol": 90.0,
+  "ignore": ["irs center where partnership filed return"],
   "fields": [
     {
       "name": "partnership_ein",
