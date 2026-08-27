@@ -162,6 +162,24 @@ foreign postal formats, and names — which are out of policy.
 On a fitting map both fixtures produce **no warnings at all**. That number matters
 as much as recall: a noisy audit is one people learn to ignore.
 
+### The coverage gate
+
+`{"quarantine_on_gap": true}` in a policy turns a high-confidence unclaimed value
+from a warning into a quarantine. It is **off by default and should stay off until
+the evaluation corpus has measured precision at high confidence** — switching it on
+early converts every false positive into a rejected client document.
+
+High confidence needs three independent signals to agree: the shape matched, the
+validator passed, and a nearby label named the same type. Neither shipped fixture
+can calibrate the gate, and the 2021 revision demonstrates why — its placeholder
+identifiers (`000-00-0000`, `00-0000000`) use an SSN area and an EIN prefix the IRS
+has never issued, so they stop at medium however clearly the label agrees.
+
+The gate raises before tokenisation, encryption and redaction, so a quarantined
+document leaves no vault rows behind. Its message names the type, page and box and
+never the value: `documents.reason` is plaintext while the filename beside it is
+encrypted.
+
 ## Extraction
 
 **The K-1 is two-column and the columns share baselines.** The partner's SSN sits

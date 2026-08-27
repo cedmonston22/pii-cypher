@@ -568,3 +568,107 @@ def test_a_deliberately_narrow_policy_still_scrubs(db, k1_bytes):
     text = extract_all_text(doc.pdf_bytes)
     assert "00-0000000" not in text
     assert "000-00-0000" in text, "an out-of-policy value must be left alone"
+
+
+# --------------------------------------------------------------------------
+# the coverage gate (phase B) -- built, and off unless asked for
+# --------------------------------------------------------------------------
+
+
+def _map_without(field_name: str) -> list[dict]:
+    """The shipped map with one field removed, to simulate a stale map."""
+    import copy
+
+    from core.fieldmap import load_field_maps
+
+    field_map = copy.deepcopy(load_field_maps()[0])
+    field_map["fields"] = [f for f in field_map["fields"] if f["name"] != field_name]
+    return [field_map]
+
+
+def test_a_coverage_gap_only_warns_unless_the_gate_is_asked_for(db, k1_2025_bytes):
+    """Off by default, and that default is the safe one.
+
+    Turning this on before the evaluation corpus has measured precision at high
+    confidence turns every false positive into a rejected client document.
+    """
+    result = scrub_batch(
+        db, [("k1.pdf", k1_2025_bytes)], field_maps=_map_without("partner_tin")
+    )
+
+    assert len(result.scrubbed) == 1
+    assert any("512-44-8890" in w for w in result.scrubbed[0].warnings)
+
+
+def test_the_gate_quarantines_a_document_whose_map_missed_an_identifier(db, k1_2025_bytes):
+    policy = {**DEFAULT_POLICY, "quarantine_on_gap": True}
+    result = scrub_batch(
+        db,
+        [("k1.pdf", k1_2025_bytes)],
+        policy=policy,
+        field_maps=_map_without("partner_tin"),
+    )
+
+    assert result.scrubbed == []
+    assert "CoverageGap" in result.quarantined[0].reason
+
+
+def test_the_gate_reason_names_no_value(db, k1_2025_bytes):
+    """documents.reason is plaintext while the filename beside it is encrypted.
+
+    The quarantine reason is written into it verbatim, so a value in that
+    message is PII at rest in the clear -- a leak this tool does not otherwise
+    have.
+    """
+    policy = {**DEFAULT_POLICY, "quarantine_on_gap": True}
+    result = scrub_batch(
+        db,
+        [("k1.pdf", k1_2025_bytes)],
+        policy=policy,
+        field_maps=_map_without("partner_tin"),
+    )
+
+    reason = result.quarantined[0].reason
+    assert "512-44-8890" not in reason
+    assert "512448890" not in reason
+    assert "SSN on page 1 at" in reason, "it must still say what and where"
+
+    stored = vault.list_documents(db, result.job_id)[0]
+    assert "512-44-8890" not in (stored.reason or "")
+
+
+def test_the_gate_does_not_fire_on_an_identifier_that_fails_its_validator(db, k1_bytes):
+    """The 2021 fixture uses placeholders the IRS never issued.
+
+    SSN area 000 is not an assignable range, so the candidate stays at medium
+    however clearly the label agrees, and a gate keyed on high confidence must
+    leave it alone. This is also why the gate cannot be calibrated on either
+    shipped fixture.
+    """
+    policy = {**DEFAULT_POLICY, "quarantine_on_gap": True}
+    result = scrub_batch(
+        db, [("k1.pdf", k1_bytes)], policy=policy, field_maps=_map_without("partner_tin")
+    )
+
+    assert len(result.scrubbed) == 1
+    assert any("000-00-0000" in w for w in result.scrubbed[0].warnings)
+
+
+def test_the_gate_leaves_no_vault_entries_behind(db, k1_2025_bytes):
+    """Raising before encrypt is what keeps a quarantined job clean.
+
+    Raising after would write vault rows for a document that never ships, since
+    store_entries sits past the except clause.
+    """
+    policy = {**DEFAULT_POLICY, "quarantine_on_gap": True}
+    result = scrub_batch(
+        db,
+        [("k1.pdf", k1_2025_bytes)],
+        policy=policy,
+        field_maps=_map_without("partner_tin"),
+    )
+
+    rows = db.execute(
+        "SELECT COUNT(*) FROM vault_entries WHERE job_id = ?", (result.job_id,)
+    ).fetchone()[0]
+    assert rows == 0

@@ -30,7 +30,7 @@ from core.fieldmap import (
 from core.keys import generate_data_key, unwrap, wrap
 from core.redact import ReplacementTooSmall, redact, restore_pdf
 from core.tokens import assign, find_tokens
-from detect import Report, detect
+from detect import CoverageGap, Report, detect
 from core.verify import (
     PlaintextSurvived,
     TokenNotWritten,
@@ -50,6 +50,7 @@ DEFAULT_POLICY: dict[str, Any] = {"pii_types": ["SSN", "ITIN", "EIN", "ADDRESS"]
 # A document must share this fraction of its tokens with an upload to be
 # considered the same document. Below it, ask the user rather than guess.
 MATCH_THRESHOLD = 0.5
+
 
 class PolicyMismatch(Exception):
     """Raised when a policy and a field map name no pii_type in common.
@@ -74,6 +75,7 @@ QUARANTINE_ERRORS = (
     UnknownForm,
     AnchorMismatch,
     PolicyMismatch,
+    CoverageGap,
     PlaintextSurvived,
     ReplacementTooSmall,
     TokenNotWritten,
@@ -235,6 +237,25 @@ def scrub_one(
     # the post-filter set would report a deliberate policy exclusion as a gap.
     report = detect(pages, field_map=field_map, located=located, policy=policy)
     warnings = report.warnings
+
+    # The coverage gate, off unless a policy asks for it. It raises here --
+    # before assign, encrypt and redact -- because raising after encrypt would
+    # leave vault entries behind for a document that never ships: store_entries
+    # sits past the except clause in scrub_batch, so failing early is also what
+    # keeps the batch transaction clean.
+    #
+    # It stays off by default deliberately. Turning it on before the evaluation
+    # corpus has measured precision at high confidence converts every false
+    # positive into a rejected client document, and neither shipped fixture can
+    # supply that measurement: both use placeholder identifiers that no
+    # validator accepts, so nothing in them ever reaches high confidence.
+    if policy.get("quarantine_on_gap", False):
+        gaps = report.gaps("high")
+        if gaps:
+            # masked(), never str(): this message is written verbatim into
+            # documents.reason, which is plaintext while the filename beside it
+            # is encrypted.
+            raise CoverageGap("; ".join(c.masked() for c in gaps))
 
     fields = _in_policy(located, policy)
 
