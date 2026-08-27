@@ -7,7 +7,7 @@
 <div class="callout warn">
   <h2>Some content could not be restored</h2>
   {% if result.unmatched %}
-  <p>Not matched to any document in this job:</p>
+  <p>These files could not be matched to any batch:</p>
   <table>
     <tr><th>File</th><th>Reason</th></tr>
     {% for doc in result.unmatched %}
@@ -17,7 +17,7 @@
   {% endif %}
   {% for doc in stuck %}
   <p><span class="mono">{{ doc.filename }}</span> still contains
-     {{ doc.unresolved|length }} token(s) that did not resolve in this job:</p>
+     {{ doc.unresolved|length }} token(s) that did not resolve:</p>
   <ul class="tokens">{% for token in doc.unresolved %}<li class="mono">{{ token }}</li>{% endfor %}</ul>
   {% endfor %}
 </div>
@@ -26,18 +26,21 @@
 {% if result.restored %}
 <h2>Restored</h2>
 <table>
-  <tr><th>File</th><th>Tokens found</th><th>Resolved</th><th>Matched document</th></tr>
+  <tr><th>Uploaded as</th><th>Originally</th><th>From batch</th><th>Tokens</th></tr>
   {% for doc in result.restored %}
   <tr>
     <td class="mono">{{ doc.filename }}</td>
-    <td>{{ doc.tokens_found }}</td>
-    <td>{% if doc.tokens_resolved == doc.tokens_found %}<span class="ok">{{ doc.tokens_resolved }}</span>
-        {% else %}{{ doc.tokens_resolved }}{% endif %}</td>
-    <td class="mono">{{ doc.doc_id[:8] if doc.doc_id else 'unmatched' }}</td>
+    <td class="mono">{{ doc.original_filename or '&mdash;' }}</td>
+    <td class="mono">{{ doc.job_id[:8] if doc.job_id else '&mdash;' }}</td>
+    <td>{% if doc.tokens_resolved == doc.tokens_found %}<span class="ok">{{ doc.tokens_resolved }}/{{ doc.tokens_found }}</span>
+        {% else %}{{ doc.tokens_resolved }}/{{ doc.tokens_found }}{% endif %}</td>
   </tr>
   {% endfor %}
 </table>
+{% if result.jobs|length > 1 %}
+<p class="hint">These files came from {{ result.jobs|length }} different batches.</p>
+{% endif %}
 {% if download %}<a class="dl" href="/download/{{ download }}">Download restored files (.zip)</a>
-<p class="hint">A reconstruction, not the original file &mdash; font metrics differ slightly.</p>{% endif %}
+<p class="hint">The page renders identically to the original; the file itself is rewritten.</p>{% endif %}
 {% endif %}
 {% endblock %}

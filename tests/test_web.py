@@ -70,11 +70,8 @@ def test_scrub_download_and_restore(client, k1_bytes):
     for name in NAMES_KEPT:
         assert name in scrubbed_text
 
-    restore = client.post(
-        "/restore",
-        data={"job_id": job_id},
-        files=[_upload("renamed.pdf", members["k1.pdf"])],
-    )
+    # No job id: the file identifies its own batch.
+    restore = client.post("/restore", files=[_upload("renamed.pdf", members["k1.pdf"])])
     assert restore.status_code == 200
     restored = _zip_members(client.get(f"/download/{_download_token(restore.text)}").content)
     restored_text = extract_all_text(restored["renamed.pdf"])
@@ -112,29 +109,61 @@ def test_non_pdf_upload_is_rejected(client):
     assert "not a PDF" in response.text
 
 
-def test_restore_with_unknown_job_is_rejected(client, k1_bytes):
-    response = client.post(
-        "/restore",
-        data={"job_id": "00000000-0000-0000-0000-000000000000"},
-        files=[_upload("k1.pdf", k1_bytes)],
-    )
-    assert response.status_code == 400
-    assert "no such job" in response.text
+def test_unscrubbed_file_is_reported_not_crashed(client, k1_bytes):
+    """A file that was never scrubbed has no tokens to identify it."""
+    response = client.post("/restore", files=[_upload("plain.pdf", k1_bytes)])
+    assert response.status_code == 200
+    assert "could not be matched" in response.text
+    assert "no tokens found" in response.text
 
 
-def test_unresolved_tokens_are_surfaced(client, k1_bytes):
+def test_restore_needs_no_job_id_field(client, k1_bytes):
+    """The form must not ask for something the user will not have."""
+    page = client.get("/restore")
+    assert 'name="job_id"' not in page.text
+    assert "identifies which batch" in page.text
+
+
+def test_one_upload_can_span_two_batches(client, k1_bytes, k1_2025_bytes):
+    """The point of the change: a pile of files from anywhere, all restored."""
+    first = client.post("/scrub", files=[_upload("a.pdf", k1_bytes)])
+    a = _zip_members(client.get(f"/download/{_download_token(first.text)}").content)["a.pdf"]
+
+    second = client.post("/scrub", files=[_upload("b.pdf", k1_2025_bytes)])
+    b = _zip_members(client.get(f"/download/{_download_token(second.text)}").content)["b.pdf"]
+
+    assert _job_id_from(first.text) != _job_id_from(second.text)
+
+    response = client.post("/restore", files=[_upload("a.pdf", a), _upload("b.pdf", b)])
+    assert response.status_code == 200
+    assert "different batches" in response.text
+
+    restored = _zip_members(client.get(f"/download/{_download_token(response.text)}").content)
+    assert set(restored) == {"a.pdf", "b.pdf"}
+    assert "000-00-0000" in extract_all_text(restored["a.pdf"])
+    assert "512-44-8890" in extract_all_text(restored["b.pdf"])
+
+
+def test_unresolved_tokens_are_surfaced(client, k1_bytes, tmp_path):
     """A partial restore must never look finished."""
-    first = client.post("/scrub", files=[_upload("k1.pdf", k1_bytes)])
-    first_zip = _zip_members(client.get(f"/download/{_download_token(first.text)}").content)
+    import re
 
-    second = client.post("/scrub", files=[_upload("k1.pdf", k1_bytes)])
-    other_job = _job_id_from(second.text)
+    from core import vault
+    from core.crypto import token_hash
 
-    response = client.post(
-        "/restore", data={"job_id": other_job}, files=[_upload("k1.pdf", first_zip["k1.pdf"])]
-    )
+    scrub = client.post("/scrub", files=[_upload("k1.pdf", k1_bytes)])
+    scrubbed = _zip_members(client.get(f"/download/{_download_token(scrub.text)}").content)["k1.pdf"]
+
+    victim = re.findall(r"PII-[A-Z0-9]{8}", extract_all_text(scrubbed))[0]
+    conn = vault.connect(str(tmp_path / "web.db"))
+    conn.execute("DELETE FROM vault_entries WHERE token_hash = ?", (token_hash(victim),))
+    conn.commit()
+    conn.close()
+
+    response = client.post("/restore", files=[_upload("k1.pdf", scrubbed)])
     assert "could not be restored" in response.text
     assert "did not resolve" in response.text
+    assert victim in response.text
 
 
 def test_jobs_page_lists_the_batch(client, k1_bytes):

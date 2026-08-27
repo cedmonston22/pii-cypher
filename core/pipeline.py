@@ -97,6 +97,17 @@ class BatchResult:
 
 
 @dataclass
+class JobMatch:
+    """Which job (or jobs) a scrubbed document's tokens belong to."""
+
+    job_id: str | None
+    tokens: list[str]
+    resolved: int
+    other_jobs: list[str] = dataclass_field(default_factory=list)
+    reason: str | None = None
+
+
+@dataclass
 class RestoredDoc:
     doc_id: str | None
     filename: str
@@ -104,6 +115,10 @@ class RestoredDoc:
     tokens_resolved: int
     unresolved: list[str]
     pdf_bytes: bytes
+    job_id: str | None = None
+    # The name the document had when it was scrubbed, decrypted for the report.
+    # Uploads get renamed, so this is often the only thing the user recognises.
+    original_filename: str | None = None
 
 
 @dataclass
@@ -114,9 +129,13 @@ class UnmatchedDoc:
 
 @dataclass
 class RestoreResult:
-    job_id: str
     restored: list[RestoredDoc] = dataclass_field(default_factory=list)
     unmatched: list[UnmatchedDoc] = dataclass_field(default_factory=list)
+
+    @property
+    def jobs(self) -> list[str]:
+        """Every distinct job this upload drew from."""
+        return sorted({d.job_id for d in self.restored if d.job_id})
 
 
 def accept_batch(files: list[tuple[str, bytes]]) -> None:
@@ -293,42 +312,106 @@ def match_document(conn: sqlite3.Connection, job_id: str, pdf_bytes: bytes) -> s
     return best_id if best_score >= MATCH_THRESHOLD else None
 
 
-def restore_batch(
-    conn: sqlite3.Connection, job_id: str, files: list[tuple[str, bytes]]
-) -> RestoreResult:
-    """Restore any subset of a job's documents.
+def identify_job(
+    conn: sqlite3.Connection, pdf_bytes: bytes, job_id: str | None = None
+) -> JobMatch:
+    """Work out which job a scrubbed document belongs to, from the file alone.
 
-    Lookups are job-scoped, so restoring one document neither needs nor affects
-    the others. The job key is unwrapped once for the whole batch.
+    Users do not keep the job id -- it is a UUID shown once, and by the time a
+    scrub needs reversing the file is the only thing they still have. Token
+    hashes are keyed by the lookup secret rather than by the job, so the vault
+    can be asked "who owns these?" without being told where to look.
+
+    ``job_id`` restricts the answer to one job when the caller already knows it.
+    """
+    try:
+        tokens = find_tokens(extract_lines(pdf_bytes))
+    except NoTextLayer:
+        return JobMatch(None, [], 0, reason="no text layer")
+
+    if not tokens:
+        return JobMatch(None, [], 0, reason="no tokens found -- was this scrubbed by this tool?")
+
+    owners = vault.find_by_token_hashes(conn, [token_hash(t) for t in tokens])
+    if job_id is not None:
+        owners = {k: v for k, v in owners.items() if k == job_id}
+    if not owners:
+        return JobMatch(None, tokens, 0, reason="these tokens are not in this vault")
+
+    ranked = sorted(owners.items(), key=lambda kv: (-len(kv[1]), kv[0]))
+    best, hashes = ranked[0]
+    return JobMatch(best, tokens, len(hashes), other_jobs=[j for j, _ in ranked[1:]])
+
+
+def _job_key(conn: sqlite3.Connection, job_id: str, cache: dict[str, bytes]) -> bytes:
+    """Unwrap a job key once per job, not once per token."""
+    if job_id not in cache:
+        vault.get_job(conn, job_id)  # raises if unknown or expired
+        cache[job_id] = unwrap(vault.get_wrapped_key(conn, job_id))
+    return cache[job_id]
+
+
+def restore_batch(
+    conn: sqlite3.Connection,
+    files: list[tuple[str, bytes]],
+    job_id: str | None = None,
+) -> RestoreResult:
+    """Restore scrubbed documents, resolving each file's job from the file itself.
+
+    Every file is resolved independently, so one upload may draw from several
+    batches. Tokens are resolved individually against whichever job owns them,
+    which means a document assembled from two batches still restores fully
+    rather than reporting half its tokens as strangers.
+
+    ``job_id`` is an optional filter for a caller that already knows the job. It
+    is never required.
     """
     accept_batch(files)
-    vault.get_job(conn, job_id)  # raises if unknown or expired
-    job_key = unwrap(vault.get_wrapped_key(conn, job_id))
 
-    result = RestoreResult(job_id=job_id)
+    result = RestoreResult()
+    keys: dict[str, bytes] = {}
 
     for filename, pdf_bytes in files:
-        try:
-            tokens = find_tokens(extract_lines(pdf_bytes))
-        except NoTextLayer:
-            result.unmatched.append(UnmatchedDoc(filename, "no text layer"))
+        match = identify_job(conn, pdf_bytes, job_id)
+        if match.job_id is None:
+            result.unmatched.append(UnmatchedDoc(filename, match.reason or "unidentified"))
             continue
 
-        if not tokens:
-            result.unmatched.append(UnmatchedDoc(filename, "no tokens found"))
+        # Check the owning batch up front so expiry stays loud. Discovering it
+        # per token would bury the reason in a list of unresolved tokens, and a
+        # user would read that as "the tool failed" rather than "this expired".
+        try:
+            _job_key(conn, match.job_id, keys)
+        except (vault.JobExpired, vault.JobNotFound) as exc:
+            result.unmatched.append(UnmatchedDoc(filename, str(exc)))
             continue
 
         value_by_token: dict[str, str] = {}
-        value_by_token_failed: set[str] = set()
         unresolved: list[str] = []
-        for token in tokens:
-            entry = vault.lookup(conn, job_id, token)
+
+        for token in match.tokens:
+            owners = vault.find_by_token_hashes(conn, [token_hash(token)])
+            if job_id is not None:
+                owners = {k: v for k, v in owners.items() if k == job_id}
+            if not owners:
+                unresolved.append(token)
+                continue
+
+            owner = match.job_id if match.job_id in owners else next(iter(owners))
+            try:
+                key = _job_key(conn, owner, keys)
+            except (vault.JobExpired, vault.JobNotFound):
+                # One expired batch must not sink tokens belonging to others.
+                unresolved.append(token)
+                continue
+
+            entry = vault.lookup(conn, owner, token)
             if entry is None:
                 unresolved.append(token)
                 continue
-            # An AAD failure here means tampering or a cross-job value. Let it raise.
+            # An AAD failure means tampering or a value from elsewhere. Let it raise.
             value_by_token[token] = decrypt(
-                job_key, entry.ciphertext, entry.nonce, aad(job_id, entry.pii_type, token)
+                key, entry.ciphertext, entry.nonce, aad(owner, entry.pii_type, token)
             )
 
         restored, unplaced = restore_pdf(pdf_bytes, value_by_token)
@@ -337,23 +420,28 @@ def restore_batch(
         # The renderer can drop replacement text silently, so confirm each value
         # actually landed rather than reporting a restore that did not happen.
         landed = extract_all_text(restored)
-        for token, value in value_by_token.items():
-            if value not in landed:
-                unresolved.append(token)
-                value_by_token_failed.add(token)
+        failed = {t for t, v in value_by_token.items() if v not in landed}
+        unresolved.extend(failed)
 
-        doc_id = match_document(conn, job_id, pdf_bytes)
+        doc_id = match_document(conn, match.job_id, pdf_bytes)
+        original = None
         if doc_id is not None:
             vault.set_document_status(conn, doc_id, "restored")
+            try:
+                original = vault.document_filename(conn, doc_id, _job_key(conn, match.job_id, keys))
+            except (vault.JobExpired, vault.JobNotFound):
+                original = None
 
         result.restored.append(
             RestoredDoc(
                 doc_id=doc_id,
                 filename=filename,
-                tokens_found=len(tokens),
-                tokens_resolved=len(value_by_token) - len(value_by_token_failed),
+                tokens_found=len(match.tokens),
+                tokens_resolved=len(value_by_token) - len(failed),
                 unresolved=sorted(set(unresolved)),
                 pdf_bytes=restored,
+                job_id=match.job_id,
+                original_filename=original,
             )
         )
 

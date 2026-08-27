@@ -4,11 +4,13 @@ import pymupdf
 import pytest
 
 from core import vault
+from core.crypto import token_hash
 from core.extract import extract_lines
 from core.fieldmap import identify, load_field_maps, locate, propagate
 from core.keys import unwrap
 from core.pipeline import (
     DEFAULT_POLICY,
+    identify_job,
     MAX_FILES,
     BatchTooLarge,
     NotAPdf,
@@ -154,7 +156,7 @@ def test_restore_returns_every_value(db, k1_bytes):
     batch = scrub_batch(db, [("k1.pdf", k1_bytes)])
     scrubbed = batch.scrubbed[0]
 
-    result = restore_batch(db, batch.job_id, [("k1-scrubbed.pdf", scrubbed.pdf_bytes)])
+    result = restore_batch(db, [("k1-scrubbed.pdf", scrubbed.pdf_bytes)], batch.job_id)
     assert not result.unmatched
     restored = result.restored[0]
     assert restored.tokens_found == len(K1_VALUES)
@@ -175,7 +177,7 @@ def test_restored_page_is_pixel_identical_to_the_original(db, k1_bytes):
     """
     batch = scrub_batch(db, [("k1.pdf", k1_bytes)])
     restored = restore_batch(
-        db, batch.job_id, [("k1.pdf", batch.scrubbed[0].pdf_bytes)]
+        db, [("k1.pdf", batch.scrubbed[0].pdf_bytes)], batch.job_id
     ).restored[0].pdf_bytes
 
     before = pymupdf.open(stream=k1_bytes, filetype="pdf")[0].get_pixmap(dpi=150)
@@ -215,7 +217,7 @@ def test_scrubbed_tokens_match_the_styling_they_replace(db, k1_bytes):
 
 def test_restore_matches_a_renamed_file(db, k1_bytes):
     batch = scrub_batch(db, [("original-name.pdf", k1_bytes)])
-    result = restore_batch(db, batch.job_id, [("totally-different.pdf", batch.scrubbed[0].pdf_bytes)])
+    result = restore_batch(db, [("totally-different.pdf", batch.scrubbed[0].pdf_bytes)], batch.job_id)
 
     assert result.restored[0].doc_id == batch.scrubbed[0].doc_id
     assert vault.list_documents(db, batch.job_id)[0].status == "restored"
@@ -229,7 +231,7 @@ def test_selective_restore_leaves_others_restorable(db, k1_bytes):
     assert len(batch.scrubbed) == 3
 
     middle = batch.scrubbed[1]
-    first_pass = restore_batch(db, batch.job_id, [("b.pdf", middle.pdf_bytes)])
+    first_pass = restore_batch(db, [("b.pdf", middle.pdf_bytes)], batch.job_id)
     assert first_pass.restored[0].tokens_resolved == first_pass.restored[0].tokens_found
 
     statuses = {d.id: d.status for d in vault.list_documents(db, batch.job_id)}
@@ -238,33 +240,57 @@ def test_selective_restore_leaves_others_restorable(db, k1_bytes):
 
     # The untouched documents still restore fully afterwards.
     for doc in (batch.scrubbed[0], batch.scrubbed[2]):
-        again = restore_batch(db, batch.job_id, [(doc.filename, doc.pdf_bytes)])
+        again = restore_batch(db, [(doc.filename, doc.pdf_bytes)], batch.job_id)
         entry = again.restored[0]
         assert entry.unresolved == []
         assert entry.tokens_resolved == entry.tokens_found
 
 
-def test_unknown_token_is_reported_not_guessed(db, k1_bytes):
-    """A token from another job must be left in place and surfaced."""
+def test_file_is_not_attributed_to_the_wrong_job(db, k1_bytes):
+    """Pinning a restore to the wrong batch must refuse, not half-restore.
+
+    The tokens are real, but they belong to another job. Filtering to the wrong
+    one has to say so rather than reporting six unresolvable tokens, which reads
+    like a tool failure instead of a mismatch.
+    """
     batch = scrub_batch(db, [("k1.pdf", k1_bytes)])
     other = scrub_batch(db, [("k1.pdf", k1_bytes)])
+    scrubbed = batch.scrubbed[0].pdf_bytes
 
-    result = restore_batch(db, other.job_id, [("k1.pdf", batch.scrubbed[0].pdf_bytes)])
-    restored = result.restored[0]
-    assert restored.tokens_resolved == 0
-    assert len(restored.unresolved) == len(K1_VALUES)
-    assert restored.doc_id is None, "must not claim a match in the wrong job"
+    wrong = restore_batch(db, [("k1.pdf", scrubbed)], other.job_id)
+    assert not wrong.restored
+    assert "not in this vault" in wrong.unmatched[0].reason
 
-    text = extract_all_text(restored.pdf_bytes)
-    for token in restored.unresolved:
-        assert token in text, "unresolved tokens stay in place"
+    # and with no job given, it finds its own
+    right = restore_batch(db, [("k1.pdf", scrubbed)])
+    assert right.restored[0].job_id == batch.job_id
+    assert right.restored[0].unresolved == []
+
+
+def test_a_token_the_vault_does_not_know_is_left_in_place(db, k1_bytes):
+    """Partial resolution: a value dropped from the vault stays tokenised."""
+    batch = scrub_batch(db, [("k1.pdf", k1_bytes)])
+    scrubbed = batch.scrubbed[0].pdf_bytes
+
+    victim = find_tokens(extract_lines(scrubbed))[0]
+    db.execute(
+        "DELETE FROM vault_entries WHERE job_id = ? AND token_hash = ?",
+        (batch.job_id, token_hash(victim)),
+    )
+    db.commit()
+
+    result = restore_batch(db, [("k1.pdf", scrubbed)])
+    doc = result.restored[0]
+    assert doc.unresolved == [victim]
+    assert doc.tokens_resolved == doc.tokens_found - 1
+    assert victim in extract_all_text(doc.pdf_bytes), "unresolved tokens stay in place"
 
 
 def test_file_without_tokens_is_unmatched(db, k1_bytes):
     batch = scrub_batch(db, [("k1.pdf", k1_bytes)])
-    result = restore_batch(db, batch.job_id, [("plain.pdf", k1_bytes)])
+    result = restore_batch(db, [("plain.pdf", k1_bytes)], batch.job_id)
     assert not result.restored
-    assert result.unmatched[0].reason == "no tokens found"
+    assert "no tokens found" in result.unmatched[0].reason
 
 
 def test_match_document_prefers_the_right_document(db, k1_bytes):
@@ -276,14 +302,22 @@ def test_match_document_prefers_the_right_document(db, k1_bytes):
         assert match_document(db, batch.job_id, doc.pdf_bytes) == doc.doc_id
 
 
-def test_restore_rejects_expired_job(db, k1_bytes):
+def test_expired_job_is_reported_not_silently_dropped(db, k1_bytes):
+    """An expired batch must name itself, not leave tokens in an unresolved list.
+
+    Burying expiry among unresolved tokens reads as "the tool failed" rather
+    than "this batch aged out", which are very different things to a user.
+    """
     batch = scrub_batch(db, [("k1.pdf", k1_bytes)])
     db.execute(
         "UPDATE jobs SET expires_at = ? WHERE id = ?", ("2000-01-01T00:00:00+00:00", batch.job_id)
     )
     db.commit()
-    with pytest.raises(vault.JobExpired):
-        restore_batch(db, batch.job_id, [("k1.pdf", batch.scrubbed[0].pdf_bytes)])
+
+    result = restore_batch(db, [("k1.pdf", batch.scrubbed[0].pdf_bytes)])
+    assert not result.restored
+    assert "expired" in result.unmatched[0].reason
+
 
 
 # --------------------------------------------------------------------------
@@ -336,7 +370,7 @@ def test_shared_partner_across_revisions_gets_one_token(db, k1_bytes, k1_2025_by
 def test_restore_works_across_revisions(db, k1_bytes, k1_2025_bytes):
     batch = scrub_batch(db, [("a.pdf", k1_bytes), ("b.pdf", k1_2025_bytes)])
     for doc, values in zip(batch.scrubbed, (K1_VALUES, K1_2025_VALUES)):
-        result = restore_batch(db, batch.job_id, [(doc.filename, doc.pdf_bytes)])
+        result = restore_batch(db, [(doc.filename, doc.pdf_bytes)], batch.job_id)
         restored = result.restored[0]
         assert restored.unresolved == []
         text = extract_all_text(restored.pdf_bytes)
@@ -348,7 +382,7 @@ def test_2025_restore_is_pixel_identical(db, k1_2025_bytes):
     """The fidelity guarantee has to hold on the revision it was not tuned against."""
     batch = scrub_batch(db, [("k1.pdf", k1_2025_bytes)])
     restored = restore_batch(
-        db, batch.job_id, [("k1.pdf", batch.scrubbed[0].pdf_bytes)]
+        db, [("k1.pdf", batch.scrubbed[0].pdf_bytes)], batch.job_id
     ).restored[0].pdf_bytes
 
     before = pymupdf.open(stream=k1_2025_bytes, filetype="pdf")[0].get_pixmap(dpi=150)
@@ -377,3 +411,121 @@ def test_stale_map_produces_a_coverage_warning(db, k1_bytes):
     assert any("000-00-0000" in w for w in doc.warnings)
     # and it really did survive into the output, which is what the warning is about
     assert "000-00-0000" in extract_all_text(doc.pdf_bytes)
+
+
+# --------------------------------------------------------------------------
+# self-identifying restore: the file knows which batch it came from
+# --------------------------------------------------------------------------
+
+
+def test_identify_job_finds_the_right_batch_among_several(db, k1_bytes, k1_2025_bytes):
+    """Three batches in the vault; each document still names its own."""
+    a = scrub_batch(db, [("a.pdf", k1_bytes)])
+    b = scrub_batch(db, [("b.pdf", k1_2025_bytes)])
+    c = scrub_batch(db, [("c.pdf", k1_bytes)])
+
+    for batch in (a, b, c):
+        match = identify_job(db, batch.scrubbed[0].pdf_bytes)
+        assert match.job_id == batch.job_id
+        assert match.resolved == len(match.tokens)
+        assert match.other_jobs == [], "tokens must not be shared between batches"
+        assert match.reason is None
+
+
+def test_identify_job_reports_why_it_failed(db, k1_bytes):
+    """Distinct reasons: nothing to go on vs tokens from somewhere else."""
+    scrub_batch(db, [("k1.pdf", k1_bytes)])
+
+    unscrubbed = identify_job(db, k1_bytes)
+    assert unscrubbed.job_id is None
+    assert "no tokens found" in unscrubbed.reason
+
+    import pymupdf
+
+    doc = pymupdf.open()
+    doc.new_page().insert_text((72, 72), "PII-ABC23456", fontsize=10)
+    foreign = identify_job(db, doc.tobytes())
+    assert foreign.job_id is None
+    assert foreign.tokens == ["PII-ABC23456"]
+    assert "not in this vault" in foreign.reason
+
+
+def test_restore_needs_no_job_id(db, k1_bytes):
+    batch = scrub_batch(db, [("k1.pdf", k1_bytes)])
+    result = restore_batch(db, [("whatever-they-renamed-it.pdf", batch.scrubbed[0].pdf_bytes)])
+
+    doc = result.restored[0]
+    assert doc.job_id == batch.job_id
+    assert doc.original_filename == "k1.pdf", "the report names what it used to be called"
+    assert doc.unresolved == []
+    assert extract_all_text(doc.pdf_bytes).count("000-00-0000") >= 1
+
+
+def test_one_upload_spans_several_batches(db, k1_bytes, k1_2025_bytes):
+    """The point of the change, and the easiest thing to regress.
+
+    Three files, three separate jobs, one upload, no job id anywhere.
+    """
+    a = scrub_batch(db, [("a.pdf", k1_bytes)])
+    b = scrub_batch(db, [("b.pdf", k1_2025_bytes)])
+    c = scrub_batch(db, [("c.pdf", k1_bytes)])
+
+    result = restore_batch(
+        db,
+        [
+            ("one.pdf", a.scrubbed[0].pdf_bytes),
+            ("two.pdf", b.scrubbed[0].pdf_bytes),
+            ("three.pdf", c.scrubbed[0].pdf_bytes),
+        ],
+    )
+
+    assert not result.unmatched
+    assert len(result.restored) == 3
+    assert sorted(result.jobs) == sorted({a.job_id, b.job_id, c.job_id})
+
+    by_name = {d.filename: d for d in result.restored}
+    assert by_name["one.pdf"].job_id == a.job_id
+    assert by_name["two.pdf"].job_id == b.job_id
+    assert by_name["three.pdf"].job_id == c.job_id
+    for doc in result.restored:
+        assert doc.unresolved == []
+        assert doc.tokens_resolved == doc.tokens_found
+
+
+def test_document_assembled_from_two_batches_restores_fully(db, k1_bytes):
+    """Resolution is per token, so a merged file is not half-unresolvable.
+
+    Pages from two jobs are concatenated. A document-level lookup would resolve
+    one page and report the other's tokens as strangers.
+    """
+    import pymupdf
+
+    a = scrub_batch(db, [("a.pdf", k1_bytes)])
+    b = scrub_batch(db, [("b.pdf", k1_bytes)])
+
+    merged = pymupdf.open()
+    for source in (a.scrubbed[0].pdf_bytes, b.scrubbed[0].pdf_bytes):
+        merged.insert_pdf(pymupdf.open(stream=source, filetype="pdf"))
+    blended = merged.tobytes()
+
+    match = identify_job(db, blended)
+    assert match.other_jobs, "this file genuinely spans two batches"
+
+    result = restore_batch(db, [("merged.pdf", blended)])
+    doc = result.restored[0]
+    assert doc.unresolved == [], "tokens from the second batch must resolve too"
+    assert doc.tokens_resolved == doc.tokens_found == 12
+
+
+def test_explicit_job_id_still_filters(db, k1_bytes):
+    """The override remains available for a caller that already knows the batch."""
+    a = scrub_batch(db, [("a.pdf", k1_bytes)])
+    b = scrub_batch(db, [("b.pdf", k1_bytes)])
+
+    result = restore_batch(
+        db,
+        [("a.pdf", a.scrubbed[0].pdf_bytes), ("b.pdf", b.scrubbed[0].pdf_bytes)],
+        a.job_id,
+    )
+    assert [d.filename for d in result.restored] == ["a.pdf"]
+    assert [d.filename for d in result.unmatched] == ["b.pdf"]

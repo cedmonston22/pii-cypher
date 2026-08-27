@@ -25,7 +25,7 @@ Command line equivalent:
 ```bash
 python cli.py scrub k1a.pdf k1b.pdf --out scrubbed.zip   # prints the job id
 python cli.py jobs -v                                     # decrypts filenames for display
-python cli.py restore scrubbed/k1a.pdf --job <job_id> --out restored.zip
+python cli.py restore scrubbed/*.pdf --out restored.zip   # no job id needed
 ```
 
 `scrub` and `restore` exit non-zero when any file was quarantined, any token failed
@@ -59,6 +59,29 @@ unreadable file is quarantined and the rest of the batch continues.
 
 Names are deliberately out of policy and stay on the form. `skip_lines: 1` drops the
 first line of each address box, which is the name.
+
+## Restore identifies itself
+
+Restoring takes no job ID. Upload any scrubbed files and each one works out which
+batch it came from, so a single upload can mix files from different batches and
+renaming them changes nothing.
+
+This works because `token_hash()` is keyed by `PII_LOOKUP_SECRET` alone, not by
+the job, so a token hashes identically everywhere and the vault can be asked *who
+owns these?* without being told where to look.
+
+Resolution is per **token**, not per document. A file whose pages were merged from
+two batches restores fully, where a document-level lookup would resolve one page
+and report the other's tokens as strangers. The document's batch, used for
+reporting and status, is just the dominant owner.
+
+The job ID was never access control, despite looking like it: `/jobs` lists every
+batch, and `/restore?job_id=X` decrypts filenames for any job handed to it.
+Dropping the field removed friction, not protection. Restricting restore would
+need authentication, which does not exist.
+
+`--job` and `?job_id=` survive as an optional filter for a caller that already
+knows the batch. Nothing requires them.
 
 ## Field maps describe *what*, not *where*
 
@@ -184,6 +207,12 @@ info dictionary, XMP metadata, embedded files, or annotations. In a real firm's 
 
 **No cross-document value hunting.** A value located in document A is not searched for
 in document B where B's map does not cover it.
+
+**Cross-job token collisions are theoretically possible.** Tokens are 8
+characters from a 32-symbol alphabet and are minted with a uniqueness check
+*within* a job only. A collision across jobs is about 1 in 10^12 per pair, and a
+document carries several tokens, so misidentifying a file would need simultaneous
+collisions. Worth knowing, not worth a mechanism.
 
 **`documents.token_hashes` leaks a join.** Anyone with database access learns which
 documents share a value, though not what the value is.

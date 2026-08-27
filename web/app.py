@@ -111,13 +111,14 @@ def jobs(request: Request):
 
 @app.get("/restore", response_class=HTMLResponse)
 def restore_form(request: Request, job_id: str = ""):
+    """Upload form. The job list is for browsing only -- restore does not need it."""
     conn = _db()
     try:
         documents = []
         if job_id:
             try:
-                vault.get_job(conn, job_id)
                 job_key = unwrap(vault.get_wrapped_key(conn, job_id))
+                vault.get_job(conn, job_id)
                 documents = [
                     {
                         "id": doc.id,
@@ -141,14 +142,19 @@ def restore_form(request: Request, job_id: str = ""):
 
 
 @app.post("/restore", response_class=HTMLResponse)
-async def restore(request: Request, job_id: str = Form(...), files: list[UploadFile] = None):
+async def restore(request: Request, files: list[UploadFile] = None):
+    """Restore uploaded files. No job id: each file identifies its own batch."""
     payloads = await _read_uploads(files or [])
     conn = _db()
     try:
-        result = restore_batch(conn, job_id, payloads)
-    except (vault.JobNotFound, vault.JobExpired, BatchTooLarge, NotAPdf) as exc:
+        result = restore_batch(conn, payloads)
+    except (BatchTooLarge, NotAPdf) as exc:
         return templates.TemplateResponse(
-            request, "restore.html", {"error": str(exc), "job_id": job_id}, status_code=400
+            request, "restore.html", {"error": str(exc)}, status_code=400
+        )
+    except MissingKeyMaterial as exc:
+        return templates.TemplateResponse(
+            request, "restore.html", {"error": f"Server not configured: {exc}"}, status_code=500
         )
     finally:
         conn.close()
@@ -156,7 +162,8 @@ async def restore(request: Request, job_id: str = Form(...), files: list[UploadF
     download = None
     if result.restored:
         archive = _zip([(d.filename, d.pdf_bytes) for d in result.restored])
-        download = _stash(f"restored-{job_id[:8]}.zip", archive)
+        stamp = result.jobs[0][:8] if result.jobs else "files"
+        download = _stash(f"restored-{stamp}.zip", archive)
 
     return templates.TemplateResponse(
         request, "restore_result.html", {"result": result, "download": download}

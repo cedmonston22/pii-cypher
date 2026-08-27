@@ -1,20 +1,18 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Restore</h1>
-<p class="lede">Upload any subset of a batch. Files are matched by the tokens they
-contain, so renaming them does not matter.</p>
+<p class="lede">Upload any scrubbed files. Each one identifies which batch it came
+from on its own &mdash; no job ID needed, and renaming them does not matter.</p>
 
 <form class="panel" action="/restore" method="post" enctype="multipart/form-data">
-  <label for="job_id">Job ID</label>
-  <input id="job_id" type="text" name="job_id" value="{{ job_id or '' }}" required
-         placeholder="00000000-0000-0000-0000-000000000000" class="mono">
-  <label for="files" style="margin-top:16px">Scrubbed PDF files</label>
+  <label for="files">Scrubbed PDF files</label>
   <input id="files" type="file" name="files" accept="application/pdf" multiple required>
+  <p class="hint">Files from different batches can be mixed in one upload.</p>
   <button type="submit">Restore</button>
 </form>
 
 {% if documents %}
-<h2>Documents in this job</h2>
+<h2>Documents in this batch</h2>
 <table>
   <tr><th>File</th><th>Form</th><th>Status</th></tr>
   {% for doc in documents %}
@@ -22,9 +20,10 @@ contain, so renaming them does not matter.</p>
   {% endfor %}
 </table>
 {% elif jobs %}
-<h2>Recent jobs</h2>
+<h2>Recent batches</h2>
+<p class="hint">For reference only. You do not need to pick one to restore.</p>
 <table>
-  <tr><th>Job</th><th>Created</th><th>Documents</th></tr>
+  <tr><th>Batch</th><th>Created</th><th>Documents</th></tr>
   {% for job in jobs %}
   <tr><td><a class="mono" href="/restore?job_id={{ job.id }}">{{ job.id }}</a></td>
       <td>{{ job.created_at[:19].replace('T', ' ') }}</td><td>{{ job.document_count }}</td></tr>

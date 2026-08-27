@@ -58,13 +58,16 @@ def cmd_scrub(args: argparse.Namespace) -> int:
 def cmd_restore(args: argparse.Namespace) -> int:
     conn = vault.connect(args.db)
     try:
-        result = restore_batch(conn, args.job, _read(args.files))
+        result = restore_batch(conn, _read(args.files), args.job)
     finally:
         conn.close()
 
     for doc in result.restored:
         state = "ok" if doc.tokens_resolved == doc.tokens_found else "PARTIAL"
-        print(f"  {state:9} {doc.filename}  {doc.tokens_resolved}/{doc.tokens_found} tokens")
+        origin = f"batch {doc.job_id[:8]}" if doc.job_id else "unknown batch"
+        was = f", originally {doc.original_filename}" if doc.original_filename else ""
+        print(f"  {state:9} {doc.filename}  {doc.tokens_resolved}/{doc.tokens_found} tokens"
+              f"  [{origin}{was}]")
         for token in doc.unresolved:
             print(f"      unresolved: {token}")
     for doc in result.unmatched:
@@ -73,6 +76,8 @@ def cmd_restore(args: argparse.Namespace) -> int:
     if result.restored:
         _write_zip(Path(args.out), [(d.filename, d.pdf_bytes) for d in result.restored])
         print(f"wrote {args.out}")
+    if len(result.jobs) > 1:
+        print(f"{chr(10)}These files came from {len(result.jobs)} different batches.")
 
     incomplete = any(d.unresolved for d in result.restored) or result.unmatched
     return 1 if incomplete else 0
@@ -105,7 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     restore = sub.add_parser("restore", help="restore any subset of a job")
     restore.add_argument("files", nargs="+")
-    restore.add_argument("--job", required=True, help="job id from the scrub run")
+    restore.add_argument(
+        "--job",
+        default=None,
+        help="optional: restrict to one batch. Files identify their own batch without it.",
+    )
     restore.add_argument("--out", default="restored.zip")
     restore.set_defaults(func=cmd_restore)
 
