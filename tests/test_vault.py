@@ -14,6 +14,7 @@ from core.vault import (
     connect,
     create_job,
     document_filename,
+    find_by_token_hashes,
     get_job,
     get_wrapped_key,
     list_documents,
@@ -179,3 +180,44 @@ def test_foreign_key_enforced(db, job):
     with pytest.raises(sqlite3.IntegrityError):
         store_key(db, "not-a-job", b"x")
         db.commit()
+
+
+def test_find_by_token_hashes_names_the_owning_job(db, job):
+    """Resolving a token to its job without being told the job first.
+
+    This works because token_hash is keyed by the lookup secret alone, not by
+    the job, so the same token hashes identically everywhere.
+    """
+    job_id, job_key = job
+    mine, theirs = "PII-ABC23456", "PII-XYZ98765"
+    ct, nonce = encrypt(job_key, "000-00-0000", aad(job_id, "ssn_tin", mine))
+    store_entries(db, job_id, [Entry(mine, "ssn_tin", ct, nonce)])
+
+    other = create_job(db, POLICY)
+    store_key(db, other, wrap(generate_data_key()))
+    ct2, nonce2 = encrypt(job_key, "111-11-1111", aad(other, "ssn_tin", theirs))
+    store_entries(db, other, [Entry(theirs, "ssn_tin", ct2, nonce2)])
+    db.commit()
+
+    owners = find_by_token_hashes(db, [token_hash(mine)])
+    assert list(owners) == [job_id]
+
+    both = find_by_token_hashes(db, [token_hash(mine), token_hash(theirs)])
+    assert set(both) == {job_id, other}
+
+
+def test_find_by_token_hashes_on_unknown_and_empty(db, job):
+    assert find_by_token_hashes(db, []) == {}
+    assert find_by_token_hashes(db, [token_hash("PII-NOTHERE2")]) == {}
+
+
+def test_find_by_token_hashes_chunks_large_inputs(db, job):
+    """More hashes than SQLite's variable limit must not raise."""
+    job_id, job_key = job
+    hashes = [token_hash(f"PII-{i:08d}") for i in range(1500)]
+    assert find_by_token_hashes(db, hashes) == {}
+
+
+def test_token_index_exists(db):
+    names = {r[1] for r in db.execute("PRAGMA index_list('vault_entries')").fetchall()}
+    assert "idx_entries_token" in names, "cross-job lookup needs its own index"

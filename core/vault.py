@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS job_keys (
 );
 
 CREATE INDEX IF NOT EXISTS idx_entries_lookup ON vault_entries (job_id, token_hash);
+-- Needed to resolve a token to its job without being told the job first. The
+-- index above cannot serve it: job_id is its leading column.
+CREATE INDEX IF NOT EXISTS idx_entries_token ON vault_entries (token_hash);
 CREATE INDEX IF NOT EXISTS idx_documents_job ON documents (job_id);
 """
 
@@ -205,6 +208,31 @@ def lookup(conn: sqlite3.Connection, job_id: str, token: str) -> Entry | None:
     if row is None:
         return None
     return Entry(token=token, pii_type=row[0], ciphertext=row[1], nonce=row[2])
+
+
+def find_by_token_hashes(conn: sqlite3.Connection, hashes: list[str]) -> dict[str, list[str]]:
+    """Return {job_id: [token_hash, ...]} for every job owning any of these.
+
+    This is what lets a scrubbed document identify its own job. Token hashes are
+    keyed by the lookup secret alone, not by the job, so the same token hashes
+    identically everywhere and the vault can be queried without being told which
+    job to look in.
+    """
+    if not hashes:
+        return {}
+
+    owners: dict[str, list[str]] = {}
+    # Chunked to stay under SQLite's variable limit on a large document.
+    for start in range(0, len(hashes), 500):
+        chunk = hashes[start : start + 500]
+        placeholders = ",".join("?" * len(chunk))
+        rows = conn.execute(
+            f"SELECT job_id, token_hash FROM vault_entries WHERE token_hash IN ({placeholders})",
+            chunk,
+        ).fetchall()
+        for job_id, token_hash_value in rows:
+            owners.setdefault(job_id, []).append(token_hash_value)
+    return owners
 
 
 def store_document(
