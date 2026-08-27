@@ -1,0 +1,31 @@
+{
+  "form_id": "us-1065-k1",
+  "identify": {
+    "all_of": ["schedule k 1", "form 1065"]
+  },
+  "col_tol": 90.0,
+  "fields": [
+    {
+      "name": "partnership_ein",
+      "pii_type": "ein",
+      "keywords": "employer identification number"
+    },
+    {
+      "name": "partnership_address",
+      "pii_type": "address",
+      "keywords": "name address city state and zip code",
+      "skip_lines": 1
+    },
+    {
+      "name": "partner_tin",
+      "pii_type": "ssn_tin",
+      "keywords": "ssn or tin"
+    },
+    {
+      "name": "partner_address",
+      "pii_type": "address",
+      "keywords": "zip code for partner",
+      "skip_lines": 1
+    }
+  ]
+}
