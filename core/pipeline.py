@@ -1,0 +1,361 @@
+"""Batch scrub and selective restore. Orchestration only.
+
+A job is one batch upload. It owns a single encryption key and a single token
+pool, so the same value receives the same token in every document of the batch.
+That pool is the reason ``token_map`` is created here and threaded through the
+document loop rather than being built per document.
+
+Failure is per document. One unreadable file must not sink the other thirty-nine.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from dataclasses import dataclass, field as dataclass_field
+from typing import Any
+
+from core import vault
+from core.crypto import aad, decrypt, encrypt, token_hash
+from core.detect import audit
+from core.extract import NoTextLayer, extract_lines, page_count
+from core.fieldmap import (
+    AnchorMismatch,
+    Field,
+    UnknownForm,
+    identify,
+    load_field_maps,
+    locate,
+    propagate,
+    verify_labels,
+)
+from core.keys import generate_data_key, unwrap, wrap
+from core.redact import ReplacementTooSmall, redact, restore_pdf
+from core.tokens import assign, find_tokens
+from core.verify import (
+    PlaintextSurvived,
+    TokenNotWritten,
+    extract_all_text,
+    verify_scrubbed,
+    verify_tokens_present,
+)
+
+MAX_FILES = 25
+MAX_FILE_BYTES = 10 * 1024 * 1024
+MAX_BATCH_BYTES = 50 * 1024 * 1024
+MAX_PAGES = 20
+PDF_MAGIC = b"%PDF"
+
+DEFAULT_POLICY: dict[str, Any] = {"pii_types": ["ein", "ssn_tin", "address"]}
+
+# A document must share this fraction of its tokens with an upload to be
+# considered the same document. Below it, ask the user rather than guess.
+MATCH_THRESHOLD = 0.5
+
+# Quarantine is expected for these; anything else is a bug and must propagate.
+QUARANTINE_ERRORS = (
+    NoTextLayer,
+    UnknownForm,
+    AnchorMismatch,
+    PlaintextSurvived,
+    ReplacementTooSmall,
+    TokenNotWritten,
+)
+
+
+class BatchTooLarge(Exception):
+    """Raised when an upload exceeds the caps that keep the request synchronous."""
+
+
+class NotAPdf(Exception):
+    """Raised when a file is not a PDF by magic bytes."""
+
+
+@dataclass
+class ScrubbedDoc:
+    doc_id: str
+    filename: str
+    form_id: str
+    page_count: int
+    replaced_count: int
+    pdf_bytes: bytes
+    # PII-shaped text the field map did not claim. Non-blocking: the document is
+    # still delivered, but a stale map surfaces here instead of failing silently.
+    warnings: list[str] = dataclass_field(default_factory=list)
+
+
+@dataclass
+class QuarantinedDoc:
+    filename: str
+    reason: str
+
+
+@dataclass
+class BatchResult:
+    job_id: str
+    scrubbed: list[ScrubbedDoc] = dataclass_field(default_factory=list)
+    quarantined: list[QuarantinedDoc] = dataclass_field(default_factory=list)
+
+
+@dataclass
+class RestoredDoc:
+    doc_id: str | None
+    filename: str
+    tokens_found: int
+    tokens_resolved: int
+    unresolved: list[str]
+    pdf_bytes: bytes
+
+
+@dataclass
+class UnmatchedDoc:
+    filename: str
+    reason: str
+
+
+@dataclass
+class RestoreResult:
+    job_id: str
+    restored: list[RestoredDoc] = dataclass_field(default_factory=list)
+    unmatched: list[UnmatchedDoc] = dataclass_field(default_factory=list)
+
+
+def accept_batch(files: list[tuple[str, bytes]]) -> None:
+    """Validate an upload against the caps and the PDF magic bytes.
+
+    Caps are what keep one synchronous request under the server timeout; they
+    are a correctness requirement of the no-queue design, not a nicety.
+
+    Raises:
+        BatchTooLarge, NotAPdf
+    """
+    if not files:
+        raise BatchTooLarge("no files supplied")
+    if len(files) > MAX_FILES:
+        raise BatchTooLarge(f"{len(files)} files exceeds the cap of {MAX_FILES}")
+
+    total = 0
+    for filename, data in files:
+        if not data.startswith(PDF_MAGIC):
+            raise NotAPdf(f"{filename} is not a PDF")
+        if len(data) > MAX_FILE_BYTES:
+            raise BatchTooLarge(f"{filename} exceeds {MAX_FILE_BYTES} bytes")
+        total += len(data)
+    if total > MAX_BATCH_BYTES:
+        raise BatchTooLarge(f"batch of {total} bytes exceeds {MAX_BATCH_BYTES}")
+
+
+def _in_policy(fields: list[Field], policy: dict[str, Any]) -> list[Field]:
+    allowed = set(policy.get("pii_types", []))
+    return [f for f in fields if f["pii_type"] in allowed]
+
+
+def scrub_one(
+    pdf_bytes: bytes,
+    job_id: str,
+    job_key: bytes,
+    token_map: dict[str, str],
+    encrypted: set[str],
+    policy: dict[str, Any],
+    field_maps: list[dict[str, Any]],
+) -> tuple[bytes, str, list[Field], list[vault.Entry], list[str]]:
+    """Scrub one document. Raises rather than returning a partial result.
+
+    Returns the scrubbed PDF, the form id, the fields replaced, vault entries for
+    values not already encrypted earlier in this batch, and any coverage
+    warnings from the content audit.
+    """
+    pages = extract_lines(pdf_bytes)
+    if page_count(pdf_bytes) > MAX_PAGES:
+        raise BatchTooLarge(f"document exceeds {MAX_PAGES} pages")
+
+    field_map = identify(pages, field_maps)
+    verify_labels(pages, field_map)
+    located = propagate(pages, locate(pages, field_map))
+
+    # Audit against everything located, before the policy filter: comparing
+    # against the post-filter set would report a deliberate policy exclusion as
+    # a coverage gap.
+    warnings = [str(w) for w in audit(pages, {f["value"] for f in located})]
+
+    fields = _in_policy(located, policy)
+
+    values = [f["value"] for f in fields]
+    assign(values, token_map)
+
+    entries: list[vault.Entry] = []
+    for value in dict.fromkeys(values):
+        if value in encrypted:
+            continue
+        pii_type = next(f["pii_type"] for f in fields if f["value"] == value)
+        token = token_map[value]
+        ciphertext, nonce = encrypt(job_key, value, aad(job_id, pii_type, token))
+        entries.append(vault.Entry(token, pii_type, ciphertext, nonce))
+        encrypted.add(value)
+
+    scrubbed = redact(pdf_bytes, fields, token_map)
+
+    # Hard gates. Nothing is released to the user unverified.
+    # Both directions matter: no original may survive, and every token must
+    # have landed -- a value removed without its token is unrecoverable.
+    verify_scrubbed(scrubbed, values)
+    verify_tokens_present(scrubbed, {token_map[v] for v in values})
+
+    return scrubbed, field_map["form_id"], fields, entries, warnings
+
+
+def scrub_batch(
+    conn: sqlite3.Connection,
+    files: list[tuple[str, bytes]],
+    policy: dict[str, Any] | None = None,
+    field_maps: list[dict[str, Any]] | None = None,
+) -> BatchResult:
+    """Scrub a batch of documents under one job key and one token pool."""
+    policy = policy or DEFAULT_POLICY
+    field_maps = field_maps if field_maps is not None else load_field_maps()
+    accept_batch(files)
+
+    job_key = generate_data_key()
+    job_id = vault.create_job(conn, policy)
+    vault.store_key(conn, job_id, wrap(job_key))
+
+    result = BatchResult(job_id=job_id)
+    token_map: dict[str, str] = {}
+    encrypted: set[str] = set()
+
+    for filename, pdf_bytes in files:
+        try:
+            scrubbed, form_id, fields, entries, warnings = scrub_one(
+                pdf_bytes, job_id, job_key, token_map, encrypted, policy, field_maps
+            )
+        except QUARANTINE_ERRORS as exc:
+            doc_reason = f"{type(exc).__name__}: {exc}"
+            vault.store_document(conn, job_id, filename, job_key, "quarantined", reason=doc_reason)
+            result.quarantined.append(QuarantinedDoc(filename=filename, reason=doc_reason))
+            continue
+
+        vault.store_entries(conn, job_id, entries)
+        tokens = sorted({token_map[f["value"]] for f in fields})
+        doc_id = vault.store_document(
+            conn,
+            job_id,
+            filename,
+            job_key,
+            "scrubbed",
+            form_id=form_id,
+            page_count=page_count(pdf_bytes),
+            token_hashes=[token_hash(t) for t in tokens],
+        )
+        result.scrubbed.append(
+            ScrubbedDoc(
+                doc_id=doc_id,
+                filename=filename,
+                form_id=form_id,
+                page_count=page_count(pdf_bytes),
+                replaced_count=len(fields),
+                pdf_bytes=scrubbed,
+                warnings=warnings,
+            )
+        )
+
+    vault.set_job_status(conn, job_id, "scrubbed" if result.scrubbed else "failed")
+    # One transaction for the whole job: a crash cannot leave it half written.
+    conn.commit()
+    return result
+
+
+def match_document(conn: sqlite3.Connection, job_id: str, pdf_bytes: bytes) -> str | None:
+    """Identify which document of a job an upload is, by token overlap.
+
+    Files get renamed, so matching is on content. Jaccard rather than overlap
+    against the recorded set: because a batch deliberately shares tokens across
+    documents, a small document whose tokens are a subset of a larger one would
+    otherwise score a perfect match against both.
+
+    Returns None when no document clears the threshold. The caller must ask
+    rather than guess.
+    """
+    try:
+        found = {token_hash(t) for t in find_tokens(extract_lines(pdf_bytes))}
+    except NoTextLayer:
+        return None
+    if not found:
+        return None
+
+    best_id, best_score = None, 0.0
+    for doc in vault.list_documents(conn, job_id):
+        recorded = set(doc.token_hashes)
+        if not recorded:
+            continue
+        score = len(found & recorded) / len(found | recorded)
+        if score > best_score:
+            best_id, best_score = doc.id, score
+
+    return best_id if best_score >= MATCH_THRESHOLD else None
+
+
+def restore_batch(
+    conn: sqlite3.Connection, job_id: str, files: list[tuple[str, bytes]]
+) -> RestoreResult:
+    """Restore any subset of a job's documents.
+
+    Lookups are job-scoped, so restoring one document neither needs nor affects
+    the others. The job key is unwrapped once for the whole batch.
+    """
+    accept_batch(files)
+    vault.get_job(conn, job_id)  # raises if unknown or expired
+    job_key = unwrap(vault.get_wrapped_key(conn, job_id))
+
+    result = RestoreResult(job_id=job_id)
+
+    for filename, pdf_bytes in files:
+        try:
+            tokens = find_tokens(extract_lines(pdf_bytes))
+        except NoTextLayer:
+            result.unmatched.append(UnmatchedDoc(filename, "no text layer"))
+            continue
+
+        if not tokens:
+            result.unmatched.append(UnmatchedDoc(filename, "no tokens found"))
+            continue
+
+        value_by_token: dict[str, str] = {}
+        value_by_token_failed: set[str] = set()
+        unresolved: list[str] = []
+        for token in tokens:
+            entry = vault.lookup(conn, job_id, token)
+            if entry is None:
+                unresolved.append(token)
+                continue
+            # An AAD failure here means tampering or a cross-job value. Let it raise.
+            value_by_token[token] = decrypt(
+                job_key, entry.ciphertext, entry.nonce, aad(job_id, entry.pii_type, token)
+            )
+
+        restored, unplaced = restore_pdf(pdf_bytes, value_by_token)
+        unresolved.extend(unplaced)
+
+        # The renderer can drop replacement text silently, so confirm each value
+        # actually landed rather than reporting a restore that did not happen.
+        landed = extract_all_text(restored)
+        for token, value in value_by_token.items():
+            if value not in landed:
+                unresolved.append(token)
+                value_by_token_failed.add(token)
+
+        doc_id = match_document(conn, job_id, pdf_bytes)
+        if doc_id is not None:
+            vault.set_document_status(conn, doc_id, "restored")
+
+        result.restored.append(
+            RestoredDoc(
+                doc_id=doc_id,
+                filename=filename,
+                tokens_found=len(tokens),
+                tokens_resolved=len(value_by_token) - len(value_by_token_failed),
+                unresolved=sorted(set(unresolved)),
+                pdf_bytes=restored,
+            )
+        )
+
+    conn.commit()
+    return result
