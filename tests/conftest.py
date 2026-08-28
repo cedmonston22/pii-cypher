@@ -31,3 +31,17 @@ def k1_2025_bytes() -> bytes:
     cover both.
     """
     return FIXTURE_2025.read_bytes()
+
+
+@pytest.fixture(scope="session")
+def packet_bytes(k1_bytes) -> bytes:
+    """Three K-1s from one partnership in a single file, one page each.
+
+    The shape a firm actually exports. Partners 2 and 3 carry their own EIN,
+    TIN and home address, so nothing here can be located by accident: before
+    per-instance location, only partner 1's six fields were found and the other
+    twelve values shipped readable on a document reported as scrubbed.
+    """
+    from tests.helpers import packet
+
+    return packet(k1_bytes)

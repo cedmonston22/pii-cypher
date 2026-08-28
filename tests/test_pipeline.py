@@ -22,6 +22,7 @@ from core.pipeline import (
 )
 from core.tokens import MAX_REVEAL_DIGITS, digits_of, find_tokens
 from core.verify import OverDisclosed, extract_all_text
+from tests.helpers import PARTNER_VALUES, packet, variant
 
 K1_VALUES = [
     "00-0000000",
@@ -39,18 +40,7 @@ def db(tmp_path):
     return vault.connect(str(tmp_path / "vault.db"))
 
 
-def _variant(pdf_bytes: bytes, swaps: dict[str, str]) -> bytes:
-    """Produce a second document at the same coordinates with different values.
-
-    Built by rewriting the fixture in place so the two-column collisions that
-    make this form interesting are preserved exactly.
-    """
-    from core.redact import redact
-
-    pages = extract_lines(pdf_bytes)
-    field_map = identify(pages, load_field_maps())
-    fields = [f for f in propagate(pages, locate(pages, field_map)) if f["value"] in swaps]
-    return redact(pdf_bytes, fields, swaps)
+_variant = variant
 
 
 def _blank_pdf() -> bytes:
@@ -864,3 +854,86 @@ def test_an_excluded_type_is_reported_not_silently_left(db, k1_bytes):
 def test_nothing_is_left_behind_under_the_default_policy(db, k1_bytes):
     doc = scrub_batch(db, [("k1.pdf", k1_bytes)]).scrubbed[0]
     assert doc.left_by_policy == {}
+
+
+# --------------------------------------------------------------------------
+# a packet: several K-1s in one uploaded file
+# --------------------------------------------------------------------------
+
+
+def test_a_packet_scrubs_every_partner(db, packet_bytes):
+    """The leak this work closes, written as a guard.
+
+    find_label returned the first match in the document and locate looped field
+    specs, never pages, so partners 2 and 3 were never located. Every release
+    gate passed: verify_scrubbed searches for the values it was handed, and it
+    was never handed these. The document shipped reported as scrubbed with
+    twelve identifiers readable on it.
+    """
+    batch = scrub_batch(db, [("packet.pdf", packet_bytes)])
+
+    assert batch.quarantined == []
+    doc = batch.scrubbed[0]
+    assert doc.page_count == 3
+    assert doc.replaced_count == 18, "six fields per partner, three partners"
+    assert doc.warnings == []
+
+    text = extract_all_text(doc.pdf_bytes)
+    for value in PARTNER_VALUES:
+        assert value not in text, f"{value!r} survived the scrub"
+
+
+def test_a_packet_mints_one_token_for_the_value_its_partners_share(db, packet_bytes):
+    """One partnership issues every K-1 in the file, so its address repeats.
+
+    Tokens are keyed by value and scoped to the batch, so the shared address is
+    one token drawn at three sites and one vault row, while the three partners'
+    own addresses stay distinct. No partner dimension is needed anywhere.
+    """
+    batch = scrub_batch(db, [("packet.pdf", packet_bytes)])
+    pages = extract_lines(batch.scrubbed[0].pdf_bytes)
+    per_page = [set(find_tokens([page])) for page in pages]
+
+    # 3 EINs + 3 TINs + 6 partner address lines + 2 shared partnership lines.
+    assert len(find_tokens(pages)) == 14
+    assert [len(t) for t in per_page] == [6, 6, 6]
+
+    shared = per_page[0] & per_page[1] & per_page[2]
+    assert len(shared) == 2, "the partnership's own address, one token at three sites"
+
+
+def test_a_packet_restores_every_partner(db, packet_bytes):
+    batch = scrub_batch(db, [("packet.pdf", packet_bytes)])
+    restored = restore_batch(
+        db, [("packet.pdf", batch.scrubbed[0].pdf_bytes)]
+    ).restored[0]
+
+    assert restored.unresolved == []
+    assert restored.tokens_resolved == restored.tokens_found
+
+    text = extract_all_text(restored.pdf_bytes)
+    for value in PARTNER_VALUES:
+        assert value in text, f"{value!r} did not come back"
+
+
+def test_a_restored_packet_is_pixel_identical_on_every_page(db, packet_bytes):
+    """Every page, not just the first.
+
+    The other pixel tests compare page 0 alone, which is all a one-page fixture
+    has. A later page is exactly where a replacement can fail to render while
+    every text-based assertion still passes.
+    """
+    batch = scrub_batch(db, [("packet.pdf", packet_bytes)])
+    restored = restore_batch(
+        db, [("packet.pdf", batch.scrubbed[0].pdf_bytes)]
+    ).restored[0].pdf_bytes
+
+    before = pymupdf.open(stream=packet_bytes, filetype="pdf")
+    after = pymupdf.open(stream=restored, filetype="pdf")
+
+    assert before.page_count == after.page_count == 3
+    for page_no in range(before.page_count):
+        a = before[page_no].get_pixmap(dpi=150)
+        b = after[page_no].get_pixmap(dpi=150)
+        assert (a.width, a.height) == (b.width, b.height)
+        assert a.samples == b.samples, f"page {page_no + 1} does not render identically"

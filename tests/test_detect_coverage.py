@@ -20,6 +20,7 @@ from core.fieldmap import identify, load_field_maps, locate, propagate
 from detect import detect
 from detect.adapter import geometry, items
 from detect.coverage import amountish, unclaimed
+from tests.helpers import packet
 
 
 @pytest.fixture
@@ -193,3 +194,41 @@ def test_a_failure_marker_carries_no_value(both, monkeypatch):
 
     rendered = " ".join(str(c) + " ".join(c.evidence) for c in report.candidates)
     assert "000-00-0000" not in rendered
+
+
+# --------------------------------------------------------------------------
+# a packet: several K-1s in one file
+# --------------------------------------------------------------------------
+
+
+def test_a_packet_with_a_fitting_map_produces_no_warnings(k1_bytes):
+    """Silence has to survive the second and third partner too.
+
+    geometry() re-runs find_label to recover the skip_lines leaders and the
+    ignore list, so it is first-match-only for the same reason locate was.
+    Left document-wide it recovers only partner 1's, and every later partner's
+    name and IRS service centre resurface as unaccounted-for fill -- three
+    false warnings on a document where nothing is actually wrong.
+    """
+    assert [str(c) for c in _warnings(packet(k1_bytes))] == []
+
+
+def test_a_packet_reports_the_partner_a_stale_map_stops_claiming(k1_bytes):
+    """And the audit still works: drop a field and every instance surfaces."""
+    reported = {c.value for c in _warnings(packet(k1_bytes), drop=("partner_tin",))}
+
+    assert {"000-00-0000", "512-44-8890", "606-12-3456"} <= reported
+
+
+def test_a_packet_that_locates_fully_has_no_high_confidence_gap(k1_bytes):
+    """The measurement that motivated per-instance location.
+
+    Before it, this document reported partner 2's and partner 3's EIN and SSN
+    at high confidence -- all three signals agreeing -- because they were on the
+    page and nothing had claimed them. That is a true positive over a real leak,
+    and it is what the coverage gate would have quarantined on.
+    """
+    pages, field_map, located = _prepare(packet(k1_bytes))
+    report = detect(pages, field_map=field_map, located=located)
+
+    assert report.gaps("high") == []

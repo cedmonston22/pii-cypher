@@ -14,7 +14,14 @@ from dataclasses import dataclass
 from typing import Any, Iterator
 
 from core.extract import Line
-from core.fieldmap import DEFAULT_COL_TOL, Field, discover_field, find_label, normalize
+from core.fieldmap import (
+    DEFAULT_COL_TOL,
+    Field,
+    discover_field,
+    find_label,
+    normalize,
+    segment,
+)
 
 from detect.types import Item, dense
 
@@ -130,32 +137,41 @@ def geometry(
     ``discover_field``. That is a second pass over a page of text, which costs
     nothing, and it means ``core.fieldmap`` needs no change to support any of
     this.
+
+    Both passes are scoped per instance for the same reason ``locate`` is.
+    Document-wide, only the first partner's skipped names and ignored boxes are
+    recovered, and every later partner's name and IRS service centre resurface
+    as unaccounted-for fill. That is not cosmetic: a fitting map is supposed to
+    produce no warnings at all, and an audit people learn to ignore is worth
+    nothing.
     """
     col_tol = field_map.get("col_tol", DEFAULT_COL_TOL)
 
     claimed = {key_of(f["page"], f["bbox"][0], f["bbox"][1]) for f in located}
     fill_styles = {(f["fontname"], round(f["size"], 1)) for f in located}
 
+    instances = segment(pages, field_map)
     skipped: set[tuple[int, float, float]] = set()
+    ignored: set[tuple[int, float, float]] = set()
     label_x0: list[float] = []
 
-    for spec in field_map["fields"]:
-        label = find_label(pages, spec["keywords"])
-        if label is None:
-            continue
-        label_x0.append(label["x0"])
-        box = discover_field(pages, label, col_tol)
-        for line in box[: spec.get("skip_lines", 0)]:
-            skipped.add(key_of(line["page"], line["x0"], line["top"]))
+    for instance in instances:
+        for spec in field_map["fields"]:
+            label = find_label(pages, spec["keywords"], instance.pages)
+            if label is None:
+                continue
+            label_x0.append(label["x0"])
+            box = discover_field(pages, label, col_tol)
+            for line in box[: spec.get("skip_lines", 0)]:
+                skipped.add(key_of(line["page"], line["x0"], line["top"]))
 
-    ignored: set[tuple[int, float, float]] = set()
-    for keywords in field_map.get("ignore", []):
-        label = find_label(pages, keywords)
-        if label is None:
-            continue
-        label_x0.append(label["x0"])
-        for line in discover_field(pages, label, col_tol):
-            ignored.add(key_of(line["page"], line["x0"], line["top"]))
+        for keywords in field_map.get("ignore", []):
+            label = find_label(pages, keywords, instance.pages)
+            if label is None:
+                continue
+            label_x0.append(label["x0"])
+            for line in discover_field(pages, label, col_tol):
+                ignored.add(key_of(line["page"], line["x0"], line["top"]))
 
     return Geometry(
         claimed=frozenset(claimed),

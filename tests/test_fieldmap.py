@@ -8,6 +8,7 @@ their label, 2025 puts them flush and the numeric fields 1.8pt to the left.
 import copy
 import json
 
+import pymupdf
 import pytest
 
 from core.extract import extract_lines
@@ -18,13 +19,16 @@ from core.fieldmap import (
     UnknownForm,
     discover_field,
     find_label,
+    find_labels,
     identify,
     load_field_maps,
     locate,
     normalize,
     propagate,
+    segment,
     verify_labels,
 )
+from tests.helpers import concat, packet, variant
 
 EXPECTED = {
     "2021": {
@@ -417,4 +421,172 @@ def test_a_malformed_ignore_is_refused(tmp_path):
     )
 
     with pytest.raises(ValueError, match="ignore"):
+        load_field_maps(tmp_path)
+
+
+# --------------------------------------------------------------------------
+# Instances: several filled copies of one form in a single file
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="module")
+def packet_pages():
+    """Three K-1s, one partnership, distinct partner values, one file."""
+    from tests.conftest import FIXTURE
+
+    return extract_lines(packet(FIXTURE.read_bytes()))
+
+
+@pytest.mark.parametrize("revision", ["2021", "2025"])
+def test_a_single_document_is_one_instance(both, maps, revision):
+    """The no-regression pin. Segmentation must be invisible to a lone form."""
+    instances = segment(both[revision], maps[0])
+
+    assert len(instances) == 1
+    assert instances[0].pages == frozenset(range(1, len(both[revision]) + 1))
+
+
+def test_a_map_without_an_anchor_is_one_instance(packet_pages, maps):
+    """Absent instance_anchor means the file holds one form, as it always did.
+
+    This is what keeps every form family that has not been looked at yet on
+    exactly the behaviour it shipped with.
+    """
+    unanchored = copy.deepcopy(maps[0])
+    del unanchored["instance_anchor"]
+
+    assert len(segment(packet_pages, unanchored)) == 1
+
+
+def test_a_packet_segments_into_one_instance_per_form(packet_pages, maps):
+    instances = segment(packet_pages, maps[0])
+
+    assert [i.pages for i in instances] == [frozenset({1}), frozenset({2}), frozenset({3})]
+    assert [i.index for i in instances] == [1, 2, 3]
+
+
+def test_a_cover_page_joins_the_first_instance(maps):
+    """Pages ahead of the first anchor are not dropped out of every lookup."""
+    from tests.conftest import FIXTURE
+
+    cover = pymupdf.open()
+    # Text-bearing, because a blank first page trips the text-layer gate before
+    # any of this is reached -- and a real transmittal sheet has text on it.
+    cover.new_page().insert_text((72, 72), "PARTNER COPIES ENCLOSED", fontsize=12)
+    body = packet(FIXTURE.read_bytes(), swaps=[{}, {"000-00-0000": "512-44-8890"}])
+    pages = extract_lines(concat([cover.tobytes(), body]))
+
+    instances = segment(pages, maps[0])
+
+    assert [i.pages for i in instances] == [frozenset({1, 2}), frozenset({3})]
+
+
+def test_find_labels_returns_every_occurrence(pages_2021):
+    """Why locate cannot simply take them all.
+
+    One K-1 carries this keyword twice -- field B for the partnership and field
+    F for the partner. A map naming it relies on B coming first, so location has
+    to stay first-match and be scoped by instance instead.
+    """
+    hits = find_labels(pages_2021, "name address city state and zip code")
+
+    assert len(hits) == 2
+    assert hits[0]["text"].startswith("B")
+    assert hits[1]["text"].startswith("F")
+
+
+def test_a_packet_locates_every_instance(packet_pages, maps):
+    """The bug this exists to close: partners 2 and 3 used to ship readable."""
+    fields = locate(packet_pages, maps[0])
+
+    assert len(fields) == 18
+    assert sorted({f["page"] for f in fields}) == [1, 2, 3]
+
+    located = {f["value"] for f in fields}
+    for value in ("45-1234567", "512-44-8890", "77 MAPLE COURT", "RENO, NV 89501"):
+        assert value in located, f"partner 2's {value!r} was not located"
+    for value in ("81-7654321", "606-12-3456", "9 BIRCH WAY", "MIAMI, FL 33101"):
+        assert value in located, f"partner 3's {value!r} was not located"
+
+
+def test_the_partner_box_is_never_claimed_as_the_partnerships(packet_pages, maps):
+    """The regression a naive find-all would introduce.
+
+    "name address city state and zip code" matches field B and field F alike, so
+    taking every occurrence would locate the partner's home address a second
+    time under the partnership's name.
+    """
+    fields = locate(packet_pages, maps[0])
+    partnership = {f["value"] for f in fields if f["name"] == "partnership_address"}
+
+    assert partnership == {"456 SAMPLE AVE", "DENVER, CO 80202"}
+
+
+def test_a_packet_leaves_propagate_nothing_to_rescue(packet_pages, maps):
+    """Location, not the safety net, is what covers the later partners now.
+
+    Merged fixtures used to look healthy because propagate matched addresses the
+    two documents happened to share. With distinct values per partner there is
+    nothing for it to match, so anything it adds here would mean locate missed.
+    """
+    fields = locate(packet_pages, maps[0])
+
+    assert propagate(packet_pages, fields) == fields
+
+
+def test_one_box_is_never_claimed_by_two_instances(packet_pages, maps):
+    positions = [(f["page"], round(f["bbox"][0], 1), round(f["bbox"][1], 1)) for f in locate(packet_pages, maps[0])]
+
+    assert len(positions) == len(set(positions))
+
+
+def test_an_incomplete_instance_is_named(maps, k1_bytes, k1_2025_bytes):
+    """A packet whose second form lacks a field must say which one.
+
+    Asked document-wide, partner 1's label answers on everyone's behalf and the
+    missing field is never noticed. "do not use tin" is wording the 2025
+    revision added to field E, so it is present in one instance and not the
+    other.
+    """
+    pages = extract_lines(concat([k1_bytes, k1_2025_bytes]))
+    broken = copy.deepcopy(maps[0])
+    broken["fields"][2]["keywords"] = "do not use tin"
+
+    assert len(segment(pages, broken)) == 2
+
+    with pytest.raises(AnchorMismatch) as exc:
+        verify_labels(pages, broken)
+    assert "instance 1" in str(exc.value)
+    assert "do not use tin" in str(exc.value)
+
+    with pytest.raises(AnchorMismatch) as exc:
+        locate(pages, broken)
+    assert "instance 1" in str(exc.value)
+
+
+def test_a_lone_documents_message_names_no_instance(both, maps):
+    """One instance carries no ordinal -- there is nothing to disambiguate."""
+    broken = copy.deepcopy(maps[0])
+    broken["fields"][0]["keywords"] = "favourite colour"
+
+    with pytest.raises(AnchorMismatch) as exc:
+        verify_labels(both["2021"], broken)
+    assert "instance" not in str(exc.value)
+
+
+def test_an_empty_instance_anchor_is_refused(tmp_path):
+    """Present-but-blank would silently mean "one instance", which is a typo."""
+    (tmp_path / "bad.json").write_text(
+        json.dumps(
+            {
+                "form_id": "bad",
+                "identify": {"all_of": ["marker"]},
+                "instance_anchor": "  ",
+                "fields": [{"name": "a", "pii_type": "SSN", "keywords": "k"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="instance_anchor"):
         load_field_maps(tmp_path)

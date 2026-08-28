@@ -18,7 +18,7 @@ import json
 import re
 import unicodedata
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, NamedTuple, TypedDict
 
 from core.extract import Line
 from core.piitypes import canonical
@@ -48,6 +48,24 @@ class Field(TypedDict):
     bbox: tuple[float, float, float, float]
     fontname: str
     size: float
+
+
+class Instance(NamedTuple):
+    """One filled copy of the form within a file.
+
+    A firm exporting thirty K-1s as a single PDF is a likely real shape, and
+    every label lookup has to be scoped to one of these. Document-wide,
+    ``find_label`` returns partner 1's line for all thirty.
+    """
+
+    index: int
+    pages: frozenset[int]
+
+    def describe(self) -> str:
+        """For an error message. Named by ordinal and page span, never by value."""
+        lo, hi = min(self.pages), max(self.pages)
+        span = f"page {lo}" if lo == hi else f"pages {lo}-{hi}"
+        return f"instance {self.index} ({span})"
 
 
 class UnknownForm(Exception):
@@ -109,6 +127,12 @@ def _validate(field_map: dict[str, Any]) -> None:
     for keywords in field_map.get("ignore", []):
         if not isinstance(keywords, str) or not keywords.strip():
             raise ValueError(f"{field_map['form_id']!r} has an empty ignore entry")
+    # Optional. Absent means the file holds one instance of the form, which is
+    # what every map meant before segmentation existed. Present and empty is a
+    # typo that would silently mean the same thing, so refuse it.
+    anchor = field_map.get("instance_anchor")
+    if anchor is not None and (not isinstance(anchor, str) or not anchor.strip()):
+        raise ValueError(f"{field_map['form_id']!r} has an empty instance_anchor")
     for field in field_map["fields"]:
         for key in ("name", "pii_type", "keywords"):
             if key not in field:
@@ -142,14 +166,77 @@ def identify(pages: list[list[Line]], field_maps: list[dict[str, Any]]) -> dict[
     raise UnknownForm("no field map matches this document")
 
 
-def find_label(pages: list[list[Line]], keywords: str) -> Line | None:
-    """Return the line whose text contains these keywords, once normalized."""
+def find_labels(
+    pages: list[list[Line]], keywords: str, within: frozenset[int] | None = None
+) -> list[Line]:
+    """Every line whose text contains these keywords, in document order.
+
+    ``within`` restricts the search to one instance's page numbers. That is not
+    an optimisation: on a packet the same label appears once per partner, and
+    the only thing separating partner 3's field E from partner 1's is which
+    pages the caller is willing to look at.
+    """
     needle = normalize(keywords)
-    for lines in pages:
-        for line in lines:
-            if needle in normalize(line["text"]):
-                return line
-    return None
+    return [
+        line
+        for lines in pages
+        for line in lines
+        if (within is None or line["page"] in within)
+        and needle in normalize(line["text"])
+    ]
+
+
+def find_label(
+    pages: list[list[Line]], keywords: str, within: frozenset[int] | None = None
+) -> Line | None:
+    """Return the first line whose text contains these keywords, once normalized.
+
+    First match, and it stays first match after segmentation. Keywords are not
+    unique within one form: on both K-1 revisions "name address city state and
+    zip code" matches field B *and* field F, so a map naming that keyword relies
+    on B coming first. Taking every occurrence instead would locate F twice, the
+    second time mislabelled as the partnership's address -- a worse bug than the
+    one multi-instance support exists to fix.
+    """
+    return next(iter(find_labels(pages, keywords, within)), None)
+
+
+def segment(pages: list[list[Line]], field_map: dict[str, Any]) -> list[Instance]:
+    """Split a file into the form instances it contains.
+
+    A map declares ``instance_anchor``: a keyword occurring exactly once per
+    filled copy of the form. On the K-1 that is "ssn or tin" -- field E. Most
+    keywords will not do. "name address city state and zip code" matches twice
+    per form, and the identify markers match two or three times on a single
+    page, so neither can delimit anything.
+
+    Without an anchor, or with fewer than two occurrences of one, the whole file
+    is one instance. That is the behaviour that predates segmentation exactly,
+    so a one-page document, a single K-1 spanning twenty pages, and any form
+    family whose map declares no anchor are all unaffected.
+
+    Boundaries are page-granular. A K-1 is a full-page form, so two instances
+    sharing a physical page is not the real shape; detection still reports the
+    second copy as a coverage gap if it ever occurs.
+    """
+    every = frozenset(range(1, len(pages) + 1))
+    anchor = field_map.get("instance_anchor")
+    starts = sorted({ln["page"] for ln in find_labels(pages, anchor)}) if anchor else []
+
+    if len(starts) < 2:
+        return [Instance(index=1, pages=every)]
+
+    bounds = starts + [len(pages) + 1]
+    instances = [
+        Instance(index=i + 1, pages=frozenset(range(bounds[i], bounds[i + 1])))
+        for i in range(len(starts))
+    ]
+
+    # A cover sheet ahead of the first anchor joins the first instance. Dropping
+    # those pages would take them out of every lookup, and out of verify_labels
+    # with them.
+    head = instances[0]
+    return [head._replace(pages=head.pages | frozenset(range(1, starts[0])))] + instances[1:]
 
 
 def _same_style(a: Line, b: Line) -> bool:
@@ -201,14 +288,25 @@ def discover_field(
 
 
 def verify_labels(pages: list[list[Line]], field_map: dict[str, Any]) -> None:
-    """Confirm every field's keywords are present.
+    """Confirm every field's keywords are present, in every instance.
+
+    Per instance, because a packet whose third K-1 is missing field E is exactly
+    what this exists to catch. Asked document-wide, partner 1's label satisfies
+    the check on all thirty partners' behalf.
 
     Raises:
-        AnchorMismatch: naming the keywords that were not found.
+        AnchorMismatch: naming the instance and the keywords not found in it.
     """
-    missing = [f["keywords"] for f in field_map["fields"] if find_label(pages, f["keywords"]) is None]
-    if missing:
-        raise AnchorMismatch(f"labels not found: {missing}")
+    instances = segment(pages, field_map)
+    for instance in instances:
+        note = "" if len(instances) == 1 else f"{instance.describe()}: "
+        missing = [
+            f["keywords"]
+            for f in field_map["fields"]
+            if find_label(pages, f["keywords"], instance.pages) is None
+        ]
+        if missing:
+            raise AnchorMismatch(f"{note}labels not found: {missing}")
 
 
 # Retained under its v1 name so callers and tests reading as "anchors" still work.
@@ -216,40 +314,59 @@ verify_anchors = verify_labels
 
 
 def locate(pages: list[list[Line]], field_map: dict[str, Any]) -> list[Field]:
-    """Extract every described field's value and bounding box.
+    """Extract every described field's value and bounding box, in every instance.
 
     Each line of a field becomes its own Field so it can be redacted
     independently.
+
+    Lookup is scoped per instance and still takes the *first* match inside it.
+    Both halves matter: without the scope, partners 2..N of a packet are never
+    located and ship readable; without first-match, "name address city state and
+    zip code" claims field F as well as field B.
     """
     col_tol = field_map.get("col_tol", DEFAULT_COL_TOL)
+    instances = segment(pages, field_map)
     fields: list[Field] = []
+    seen: set[tuple[int, float, float]] = set()
 
-    for spec in field_map["fields"]:
-        label = find_label(pages, spec["keywords"])
-        if label is None:
-            raise AnchorMismatch(f"label not found: {spec['keywords']!r}")
+    for instance in instances:
+        note = "" if len(instances) == 1 else f"{instance.describe()}: "
 
-        # skip_lines drops leading lines of a box that are out of policy -- on a
-        # K-1 the first line of an address box is the name.
-        lines = discover_field(pages, label, col_tol)[spec.get("skip_lines", 0) :]
-        if not lines:
-            raise AnchorMismatch(
-                f"field {spec['name']!r} has no value lines below its label "
-                f"{spec['keywords']!r}"
-            )
+        for spec in field_map["fields"]:
+            label = find_label(pages, spec["keywords"], instance.pages)
+            if label is None:
+                raise AnchorMismatch(f"{note}label not found: {spec['keywords']!r}")
 
-        for line in lines:
-            fields.append(
-                Field(
-                    name=spec["name"],
-                    pii_type=spec["pii_type"],
-                    value=line["text"],
-                    page=line["page"],
-                    bbox=(line["x0"], line["top"], line["x1"], line["bottom"]),
-                    fontname=line["fontname"],
-                    size=line["size"],
+            # skip_lines drops leading lines of a box that are out of policy --
+            # on a K-1 the first line of an address box is the name.
+            lines = discover_field(pages, label, col_tol)[spec.get("skip_lines", 0) :]
+            if not lines:
+                raise AnchorMismatch(
+                    f"{note}field {spec['name']!r} has no value lines below its "
+                    f"label {spec['keywords']!r}"
                 )
-            )
+
+            for line in lines:
+                # No two instances may claim the same box. A mis-declared anchor
+                # is how that happens, and the cost is a value redacted twice --
+                # the second pass drawing its token over the first one's, which
+                # verify_tokens_present cannot see because both tokens are on
+                # the page.
+                key = (line["page"], round(line["x0"], 1), round(line["top"], 1))
+                if key in seen:
+                    continue
+                seen.add(key)
+                fields.append(
+                    Field(
+                        name=spec["name"],
+                        pii_type=spec["pii_type"],
+                        value=line["text"],
+                        page=line["page"],
+                        bbox=(line["x0"], line["top"], line["x1"], line["bottom"]),
+                        fontname=line["fontname"],
+                        size=line["size"],
+                    )
+                )
 
     return fields
 
