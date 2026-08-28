@@ -19,12 +19,17 @@ from pathlib import Path
 
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from core import vault
 from core.keys import MissingKeyMaterial, unwrap
 from core.piitypes import canonical
 from core.pipeline import (
+    MAX_BATCH_BYTES,
+    MAX_FILES,
+    MAX_FILE_BYTES,
+    MAX_PAGES,
     DEFAULT_POLICY,
     BatchTooLarge,
     NotAPdf,
@@ -53,8 +58,24 @@ POLICY_ROWS = [
 ]
 REVEAL_CHOICES = list(range(2, MAX_REVEAL_DIGITS + 1))
 
+# Rendered into the upload copy and the client-side gauges. Derived from the
+# constants the pipeline actually enforces, never retyped: the template used to
+# hard-code "20 pages per document" and still said it after the cap moved to 100.
+CAPS = {
+    "max_files": MAX_FILES,
+    "max_file_bytes": MAX_FILE_BYTES,
+    "max_batch_bytes": MAX_BATCH_BYTES,
+    "max_file_mb": MAX_FILE_BYTES // (1024 * 1024),
+    "max_batch_mb": MAX_BATCH_BYTES // (1024 * 1024),
+    "max_pages": MAX_PAGES,
+}
+
 app = FastAPI(title="PII Scrubber")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+# Alpine is vendored rather than pulled from a CDN: the tool is meant to run
+# offline on a firm's own machine, and a scrubbing UI that silently depends on
+# a third party at page load is the wrong trade.
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 _downloads: dict[str, tuple[float, str, bytes]] = {}
 
@@ -140,6 +161,8 @@ def _form_context(
         "reveal_choices": REVEAL_CHOICES,
         "chosen": set(chosen if chosen is not None else DEFAULT_POLICY["pii_types"]),
         "reveal": reveal or {},
+        "caps": CAPS,
+        "nav": "scrub",
     }
 
 
@@ -199,7 +222,9 @@ async def scrub(
 def jobs(request: Request):
     conn = _db()
     try:
-        return templates.TemplateResponse(request, "jobs.html", {"jobs": vault.list_jobs(conn)})
+        return templates.TemplateResponse(
+            request, "jobs.html", {"jobs": vault.list_jobs(conn), "nav": "history"}
+        )
     finally:
         conn.close()
 
@@ -225,12 +250,17 @@ def restore_form(request: Request, job_id: str = ""):
                 ]
             except (vault.JobNotFound, vault.JobExpired) as exc:
                 return templates.TemplateResponse(
-                    request, "restore.html", {"error": str(exc), "job_id": job_id}
+                    request, "restore.html", {"error": str(exc), "job_id": job_id, "nav": "restore"}
                 )
         return templates.TemplateResponse(
             request,
             "restore.html",
-            {"job_id": job_id, "documents": documents, "jobs": vault.list_jobs(conn, limit=10)},
+            {
+                "job_id": job_id,
+                "documents": documents,
+                "jobs": vault.list_jobs(conn, limit=10),
+                "nav": "restore",
+            },
         )
     finally:
         conn.close()
@@ -245,7 +275,7 @@ async def restore(request: Request, files: list[UploadFile] = None):
         result = restore_batch(conn, payloads)
     except (BatchTooLarge, NotAPdf) as exc:
         return templates.TemplateResponse(
-            request, "restore.html", {"error": str(exc)}, status_code=400
+            request, "restore.html", {"error": str(exc), "nav": "restore"}, status_code=400
         )
     except MissingKeyMaterial as exc:
         return templates.TemplateResponse(
@@ -261,7 +291,7 @@ async def restore(request: Request, files: list[UploadFile] = None):
         download = _stash(f"restored-{stamp}.zip", archive)
 
     return templates.TemplateResponse(
-        request, "restore_result.html", {"result": result, "download": download}
+        request, "restore_result.html", {"result": result, "download": download, "nav": "restore"}
     )
 
 

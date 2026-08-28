@@ -1,71 +1,321 @@
 {% extends "base.html" %}
+{% block head %}
+<style>
+  .shell {
+    display:grid; grid-template-columns:380px minmax(0,1fr); gap:48px; align-items:start;
+  }
+  @media (max-width: 1040px) { .shell { grid-template-columns:1fr; gap:32px; } }
+
+  /* ---------------------------- policy sidebar --------------------------- */
+  .policy-head { padding:20px 22px 16px; border-bottom:1px solid var(--line); }
+  .policy-head h2 { font-family:var(--serif); font-weight:500; font-size:20px; margin:0 0 3px; line-height:1.2; }
+  .policy-head p { margin:0; font-size:13px; color:var(--muted); }
+
+  table.policy { margin:0; }
+  table.policy th { padding:9px 6px; white-space:nowrap; }
+  table.policy th:first-child, table.policy td:first-child { padding-left:22px; }
+  table.policy th:last-child, table.policy td:last-child { padding-right:22px; }
+  table.policy th.mid, table.policy td.mid { text-align:center; }
+  table.policy td { padding:13px 6px; vertical-align:middle; }
+  table.policy tbody tr:hover td { background:var(--well); }
+  table.policy tbody tr:last-child td { border-bottom:0; }
+  /* base.html sets label{display:block;font-weight:600}; the grid needs neither. */
+  table.policy label { display:block; margin:0; font-weight:600; }
+
+  .type-name { font-family:var(--mono); font-size:13px; letter-spacing:.06em; color:var(--ink); cursor:pointer; }
+  /* Nested inside .type-name so the whole cell is a click target, which means
+     it inherits the mono face -- state the sans explicitly or the field
+     descriptions render as code. */
+  .type-field {
+    display:block; margin-top:3px; font-family:var(--sans); font-size:12.5px;
+    line-height:1.45; color:var(--muted); font-weight:400; letter-spacing:0;
+  }
+  .type-field b { font-family:var(--mono); font-size:12px; font-weight:600; color:var(--ink-2); }
+
+  .lands { padding:18px 22px 20px; border-top:1px solid var(--line); }
+  .lands .cap {
+    font-family:var(--mono); font-size:10px; letter-spacing:.11em;
+    text-transform:uppercase; color:var(--muted); margin:0 0 12px;
+  }
+  .chip {
+    font-family:var(--mono); font-size:12.5px; padding:4px 9px; border-radius:5px;
+    border:1px solid var(--line); background:var(--well); white-space:nowrap;
+  }
+  .chip .tail { color:var(--caution-ink); font-weight:600; }
+  .lands .pair { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+  .lands .arrow { color:var(--muted); }
+  .lands .note { font-size:12px; color:var(--muted); margin:5px 0 14px; }
+  .said { border-left:2px solid var(--caution-line); padding:2px 0 2px 13px; margin:0 0 12px; }
+  .said p { font-family:var(--serif); font-size:15px; line-height:1.5; margin:0; color:var(--ink-2); }
+  .said p + p { margin-top:9px; }
+  .fineprint { font-size:12.5px; line-height:1.5; color:var(--muted); margin:0; }
+
+  /* ------------------------------- dropzone ------------------------------ */
+  .dropzone {
+    display:block; border:1.5px dashed var(--edge-dash); border-radius:8px;
+    background:var(--surface); padding:52px 30px; text-align:center; cursor:pointer;
+    transition:border-color .14s ease, background-color .14s ease;
+  }
+  .dropzone:hover, .dropzone.is-drag { border-color:var(--accent); background:var(--accent-soft); }
+  .dropzone svg { width:30px; height:30px; color:var(--accent); margin-bottom:12px; }
+  .dropzone .big { font-family:var(--serif); font-size:24px; line-height:1.2; margin:0 0 7px; }
+  .dropzone .sub { font-size:13.5px; color:var(--muted); margin:0 auto; max-width:46ch; }
+  .dropzone .fake { margin-top:18px; display:inline-flex; }
+
+  /* -------------------------------- gauges ------------------------------- */
+  .gauges {
+    display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); margin-top:18px;
+    border:1px solid var(--line); border-radius:6px; background:var(--surface); overflow:hidden;
+  }
+  .gauges > div { padding:11px 16px; border-left:1px solid var(--line); }
+  .gauges > div:first-child { border-left:0; }
+  .gauges .k {
+    font-family:var(--mono); font-size:10px; letter-spacing:.11em;
+    text-transform:uppercase; color:var(--muted); display:block; margin-bottom:2px;
+  }
+  .gauges .v { font-family:var(--mono); font-size:15px; color:var(--muted); }
+  .gauges .v b { color:var(--ink); font-weight:600; }
+  .gauges .over b, .gauges .over { color:var(--bad); }
+
+  /* ------------------------------ file queue ----------------------------- */
+  .queue-head {
+    display:flex; justify-content:space-between; align-items:baseline;
+    margin:30px 0 0; padding-bottom:8px; border-bottom:1px solid var(--line);
+    font-family:var(--mono); font-size:10px; letter-spacing:.11em;
+    text-transform:uppercase; color:var(--muted);
+  }
+  .queue-head .tally { font-family:var(--sans); font-size:13px; letter-spacing:0; text-transform:none; }
+  .queue-head .tally b { color:var(--ink); }
+  .frow {
+    display:flex; align-items:center; gap:14px; padding:12px 2px;
+    border-bottom:1px solid var(--line);
+  }
+  .frow .nm { font-family:var(--mono); font-size:13px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .frow .sz { font-family:var(--mono); font-size:12.5px; color:var(--muted); }
+  .frow.too-big .sz { color:var(--bad); font-weight:600; }
+  .empty { padding:16px 2px; color:var(--muted); font-size:13.5px; }
+  .actions { display:flex; align-items:center; gap:12px; margin-top:26px; flex-wrap:wrap; }
+  .actions .why { font-size:13px; color:var(--muted); max-width:38ch; }
+</style>
+{% endblock %}
+
 {% block content %}
-<h1>Scrub a batch</h1>
-<p class="lede">Upload Schedule K-1s. Identifiers are replaced with tokens and the
-originals are encrypted under a key belonging to this batch.</p>
+{#  Caps come from the server so the copy cannot drift from the constants the
+    pipeline actually enforces -- the old template hard-coded "20 pages" and was
+    still saying it after the cap moved to 100.  #}
+<form class="shell" action="/scrub" method="post" enctype="multipart/form-data"
+      x-data="uploader({{ caps.max_files }}, {{ caps.max_file_bytes }}, {{ caps.max_batch_bytes }})">
 
-<form class="panel" action="/scrub" method="post" enctype="multipart/form-data">
-  <label for="files">PDF files</label>
-  <input id="files" type="file" name="files" accept="application/pdf" multiple required>
-  <p class="hint">Up to 25 files, 10&nbsp;MB each, 50&nbsp;MB per batch, 20 pages per document.
-  Processing is synchronous, so the batch is capped to keep the request responsive.</p>
+  <!-- ============================== sidebar ============================== -->
+  <aside class="card">
+    <div class="policy-head">
+      <h2>Policy</h2>
+      <p>Applies to every file in this batch.</p>
+    </div>
 
-  <!-- Marks a submission as carrying policy controls. Without it an empty
-       pii_types means "the client sent no policy" rather than "the user
-       unticked everything", and only the second is an error. -->
-  <input type="hidden" name="policy_form" value="1">
-  <label>What to replace</label>
-  {% if not rows %}
-  {# An empty table is an unusable form that still looks finished. It means the
-     handler rendered this without _form_context -- most often a server running
-     older Python than the template on disk, since Jinja reloads and uvicorn
-     does not. Say so rather than showing four headers and no controls. #}
-  <div class="callout bad">
-    <strong>The policy controls did not load.</strong>
-    <p class="hint">This page is newer than the server process rendering it.
-    Restart the app and reload.</p>
+    {#  Marks a submission as carrying policy controls. Without it an empty
+        pii_types means "the client sent no policy" rather than "the user
+        unticked everything", and only the second is an error.  #}
+    <input type="hidden" name="policy_form" value="1">
+
+    {% if not rows %}
+    <div class="callout bad" style="margin:16px 22px;">
+      <strong>The policy controls did not load.</strong>
+      <p class="hint">This page is newer than the server process rendering it.
+      Restart the app and reload.</p>
+    </div>
+    {% endif %}
+
+    <table class="policy">
+      <thead>
+        <tr>
+          <th>Type and field</th>
+          <th class="mid">Tokenise</th>
+          <th class="mid">Show last</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr>
+          <td>
+            <label class="type-name" for="t-{{ row.type|lower }}">{{ row.type }}
+              <span class="type-field">{{ row.field }}</span>
+            </label>
+          </td>
+          <td class="mid">
+            <input type="checkbox" name="pii_types" value="{{ row.type }}"
+                   id="t-{{ row.type|lower }}"{% if row.type in chosen %} checked{% endif %}>
+          </td>
+          <td class="mid">
+            {% if row.digits %}
+            <label class="sr-only" for="r-{{ row.type|lower }}">Digits of the {{ row.type }} left readable</label>
+            <select name="reveal" id="r-{{ row.type|lower }}" x-model="reveal['{{ row.type }}']">
+              <option value="{{ row.type }}=0">none</option>
+              {% for n in reveal_choices %}
+              <option value="{{ row.type }}={{ n }}"{% if reveal.get(row.type) == n %} selected{% endif %}>{{ n }}</option>
+              {% endfor %}
+            </select>
+            {% else %}
+            <span class="muted" aria-hidden="true">&mdash;</span>
+            <span class="sr-only">An address has no digit run to reveal.</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+    <div class="lands">
+      <p class="cap">What lands on the page</p>
+      <div class="pair">
+        <span class="chip">45-1234567</span>
+        <span class="arrow" aria-hidden="true">&rarr;</span>
+        <span class="chip">PII-7ZURMBHA</span>
+      </div>
+      <p class="note">show last: none</p>
+      <div class="pair">
+        <span class="chip">45-1234567</span>
+        <span class="arrow" aria-hidden="true">&rarr;</span>
+        <span class="chip">PII-7ZURMBHA<span class="tail">-4567</span></span>
+      </div>
+      <p class="note">show last: 4</p>
+
+      <div class="said">
+        <p>An SSN and an EIN are nine digits, so showing <u>six</u> of them hides three.
+           At the top of the range this is closer to disclosure than to redaction.</p>
+        <p>Unticking a type leaves that identifier readable on the delivered document.</p>
+      </div>
+
+      <div class="callout warn" x-cloak x-show="loudReveal" style="margin:0 0 12px; padding:11px 13px;">
+        <strong style="font-size:13.5px;">You are revealing <span x-text="loudReveal"></span> digits.</strong>
+        <p class="hint" style="margin-top:2px;">Of nine. The recipient can match the value against
+           their own records &mdash; which may be the point, but it is a disclosure.</p>
+      </div>
+
+      <p class="fineprint">Names are deliberately out of policy and stay on the form &mdash; the
+        recipient still has to know whose K-1 this is. The value is encrypted whole either way,
+        and restores whole.</p>
+    </div>
+  </aside>
+
+  <!-- =============================== main ================================ -->
+  <div>
+    <h1>Scrub a batch</h1>
+    <p class="lede">Identifiers are replaced with tokens and the originals encrypted under a key
+      belonging to this batch, so they can be restored later. Uploaded bytes are never written
+      to disk.</p>
+
+    {#  The real control. Alpine keeps input.files in step with its own list so
+        Remove works, but the form still submits as an ordinary multipart POST --
+        no fetch, no JSON, and the server contract is untouched.  #}
+    <label class="dropzone" for="files"
+           :class="{ 'is-drag': dragging }"
+           x-on:dragover.prevent="dragging = true"
+           x-on:dragleave.prevent="dragging = false"
+           x-on:drop.prevent="dragging = false; add($event.dataTransfer.files)">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5Z"
+              stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+        <path d="M12 11v6M9 14h6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+      <p class="big">Drop Schedule K-1s here</p>
+      <p class="sub">PDF only. A text layer is required &mdash; a pure scan is refused at the gate.
+        Up to {{ caps.max_files }} files, {{ caps.max_file_mb }}&nbsp;MB each,
+        {{ caps.max_batch_mb }}&nbsp;MB per batch, {{ caps.max_pages }} pages per document.</p>
+      <span class="btn fake" aria-hidden="true">Choose files</span>
+      <input class="sr-only" id="files" type="file" name="files" accept="application/pdf"
+             multiple required x-ref="input" x-on:change="add($event.target.files)">
+    </label>
+
+    <div class="gauges" x-cloak x-show="files.length">
+      <div :class="{ over: files.length > maxFiles }">
+        <span class="k">Files</span>
+        <span class="v"><b x-text="files.length"></b> of {{ caps.max_files }}</span>
+      </div>
+      <div :class="{ over: largest > maxFile }">
+        <span class="k">Largest file</span>
+        <span class="v"><b x-text="fmt(largest)"></b> of {{ caps.max_file_mb }} MB</span>
+      </div>
+      <div :class="{ over: total > maxBatch }">
+        <span class="k">Batch total</span>
+        <span class="v"><b x-text="fmt(total)"></b> of {{ caps.max_batch_mb }} MB</span>
+      </div>
+    </div>
+
+    <div class="queue-head" x-cloak x-show="files.length">
+      <span>Selected</span>
+      <span class="tally"><b x-text="files.length"></b> file<span x-show="files.length !== 1">s</span>
+        &middot; <span x-text="fmt(total)"></span> of {{ caps.max_batch_mb }} MB</span>
+    </div>
+
+    <template x-for="(f, i) in files" :key="f.name + f.size">
+      <div class="frow" :class="{ 'too-big': f.size > maxFile }">
+        <span class="nm" x-text="f.name"></span>
+        <span class="sz" x-text="fmt(f.size)"></span>
+        <button type="button" class="btn-ghost" x-on:click="remove(i)">Remove
+          <span class="sr-only" x-text="f.name"></span>
+        </button>
+      </div>
+    </template>
+
+    <p class="empty" x-cloak x-show="!files.length">No files chosen yet.</p>
+
+    <div class="actions">
+      <button type="submit" class="btn-primary" :disabled="!files.length || overCap">Scrub batch</button>
+      <button type="button" x-cloak x-show="files.length" x-on:click="clearAll()">Clear</button>
+      <p class="why" x-cloak x-show="overCap" style="color:var(--bad);">
+        This batch is over a limit. Remove a file before scrubbing.</p>
+      <p class="why" x-show="!overCap">Processing is synchronous. The scrubbed batch stays
+        restorable for 30 days.</p>
+    </div>
   </div>
-  {% endif %}
-  <table class="policy">
-    <tr>
-      <th>Type</th>
-      <th>Fields on the K-1</th>
-      <th class="pick">Tokenise</th>
-      <th class="pick">Show last</th>
-    </tr>
-    {% for row in rows %}
-    <tr>
-      <td><strong>{{ row.type }}</strong></td>
-      <td>{{ row.field }}</td>
-      <td class="pick">
-        <input type="checkbox" name="pii_types" value="{{ row.type }}"
-               aria-label="Tokenise {{ row.type }}"
-               {% if row.type in chosen %}checked{% endif %}>
-      </td>
-      <td class="pick">
-        {% if row.digits %}
-        <select name="reveal" aria-label="Digits of {{ row.type }} left readable">
-          <option value="{{ row.type }}=0">none</option>
-          {% for n in reveal_choices %}
-          <option value="{{ row.type }}={{ n }}"
-                  {% if reveal.get(row.type) == n %}selected{% endif %}>{{ n }}</option>
-          {% endfor %}
-        </select>
-        {% else %}
-        <span class="muted">&mdash;</span>
-        {% endif %}
-      </td>
-    </tr>
-    {% endfor %}
-  </table>
-  <p class="hint">Names are deliberately out of policy and are left on the form.
-  Unticking a type leaves that identifier readable on the document; the result
-  page says so, and says how many.</p>
-  <p class="hint"><strong>Showing the last digits</strong> keeps a value matchable
-  by whoever receives the document, and the whole value is still recoverable on
-  restore. It is a real disclosure though: an SSN and an EIN are nine digits, so
-  showing six leaves only three hidden.</p>
-
-  <button type="submit">Scrub batch</button>
 </form>
+
+<script>
+  function uploader(maxFiles, maxFile, maxBatch) {
+    return {
+      files: [], dragging: false,
+      maxFiles: maxFiles, maxFile: maxFile, maxBatch: maxBatch,
+      reveal: { {% for row in rows %}{% if row.digits %}'{{ row.type }}': '{{ row.type }}={{ reveal.get(row.type, 0) }}',{% endif %}{% endfor %} },
+
+      add(list) {
+        for (const f of list) {
+          if (!this.files.some(x => x.name === f.name && x.size === f.size)) this.files.push(f);
+        }
+        this.sync();
+      },
+      remove(i) { this.files.splice(i, 1); this.sync(); },
+      clearAll() { this.files = []; this.sync(); },
+
+      // Rebuild the input's FileList from our array. Without this, Remove would
+      // change the display but still upload the file.
+      sync() {
+        const dt = new DataTransfer();
+        this.files.forEach(f => dt.items.add(f));
+        this.$refs.input.files = dt.files;
+      },
+
+      get total() { return this.files.reduce((a, f) => a + f.size, 0); },
+      get largest() { return this.files.reduce((a, f) => Math.max(a, f.size), 0); },
+      get overCap() {
+        return this.files.length > this.maxFiles
+            || this.largest > this.maxFile
+            || this.total > this.maxBatch;
+      },
+      // The loudest reveal currently selected, or 0. Values arrive as "SSN=4".
+      get loudReveal() {
+        const n = Object.values(this.reveal)
+          .map(v => parseInt(String(v).split('=')[1] || '0', 10))
+          .reduce((a, b) => Math.max(a, b), 0);
+        return n >= 5 ? n : 0;
+      },
+
+      fmt(b) {
+        if (!b) return '0 KB';
+        return b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB'
+                            : Math.max(1, Math.round(b / 1024)) + ' KB';
+      },
+    };
+  }
+</script>
 {% endblock %}
