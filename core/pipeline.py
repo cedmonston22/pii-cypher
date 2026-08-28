@@ -46,7 +46,8 @@ from core.verify import (
 MAX_FILES = 25
 MAX_FILE_BYTES = 10 * 1024 * 1024
 MAX_BATCH_BYTES = 50 * 1024 * 1024
-MAX_PAGES = 20
+# One K-1 per partner is a page each, so 20 refused a small partnership.
+MAX_PAGES = 100
 PDF_MAGIC = b"%PDF"
 
 DEFAULT_POLICY: dict[str, Any] = {"pii_types": ["SSN", "ITIN", "EIN", "ADDRESS"]}
@@ -76,8 +77,34 @@ class PolicyMismatch(Exception):
     """
 
 
+class BatchTooLarge(Exception):
+    """Raised when an upload exceeds the caps that keep the request synchronous.
+
+    Batch-level and deliberately *not* quarantinable: file count, per-file bytes
+    and total bytes are properties of the request, so there is no single
+    document to quarantine and nothing to salvage.
+    """
+
+
+class DocumentTooLong(Exception):
+    """Raised when one document exceeds the per-document page cap.
+
+    Separate from BatchTooLarge, and quarantinable, because it is a property of
+    one file. Raised inside scrub_one, the old BatchTooLarge escaped the
+    per-document except in scrub_batch and aborted the run: a batch of
+    twenty-five with one over-long file returned nothing and lost the other
+    twenty-four. That contradicted this module's own contract -- failure is per
+    document.
+    """
+
+
+class NotAPdf(Exception):
+    """Raised when a file is not a PDF by magic bytes."""
+
+
 # Quarantine is expected for these; anything else is a bug and must propagate.
 QUARANTINE_ERRORS = (
+    DocumentTooLong,
     NoTextLayer,
     UnknownForm,
     AnchorMismatch,
@@ -88,14 +115,6 @@ QUARANTINE_ERRORS = (
     TokenNotWritten,
     OverDisclosed,
 )
-
-
-class BatchTooLarge(Exception):
-    """Raised when an upload exceeds the caps that keep the request synchronous."""
-
-
-class NotAPdf(Exception):
-    """Raised when a file is not a PDF by magic bytes."""
 
 
 @dataclass
@@ -252,9 +271,13 @@ def scrub_one(
     values not already encrypted earlier in this batch, any coverage warnings
     from the content audit, and a per-type count of what the policy left behind.
     """
-    pages = extract_lines(pdf_bytes)
+    # Counted before extraction, not after: page_count only opens the file,
+    # while extract_lines walks every word on every page. Parsing five hundred
+    # pages to then refuse them is work nobody asked for.
     if page_count(pdf_bytes) > MAX_PAGES:
-        raise BatchTooLarge(f"document exceeds {MAX_PAGES} pages")
+        raise DocumentTooLong(f"document exceeds {MAX_PAGES} pages")
+
+    pages = extract_lines(pdf_bytes)
 
     field_map = identify(pages, field_maps)
     _check_policy_fits(field_map, policy)
@@ -385,6 +408,7 @@ def scrub_batch(
 
     for filename, pdf_bytes in files:
         try:
+            doc_pages = page_count(pdf_bytes)
             (
                 scrubbed,
                 form_id,
@@ -411,7 +435,7 @@ def scrub_batch(
             job_key,
             "scrubbed",
             form_id=form_id,
-            page_count=page_count(pdf_bytes),
+            page_count=doc_pages,
             token_hashes=[token_hash(t) for t in tokens],
         )
         result.scrubbed.append(
@@ -419,7 +443,7 @@ def scrub_batch(
                 doc_id=doc_id,
                 filename=filename,
                 form_id=form_id,
-                page_count=page_count(pdf_bytes),
+                page_count=doc_pages,
                 replaced_count=len(fields),
                 pdf_bytes=scrubbed,
                 warnings=warnings,

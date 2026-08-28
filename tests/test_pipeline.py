@@ -13,16 +13,19 @@ from core.pipeline import (
     identify_job,
     MAX_FILES,
     BatchTooLarge,
+    DocumentTooLong,
+    MAX_PAGES,
     NotAPdf,
     PolicyMismatch,
     accept_batch,
     match_document,
     restore_batch,
     scrub_batch,
+    scrub_one,
 )
 from core.tokens import MAX_REVEAL_DIGITS, digits_of, find_tokens
 from core.verify import OverDisclosed, extract_all_text
-from tests.helpers import PARTNER_VALUES, packet, variant
+from tests.helpers import PARTNER_VALUES, packet, repeat, variant
 
 K1_VALUES = [
     "00-0000000",
@@ -937,3 +940,35 @@ def test_a_restored_packet_is_pixel_identical_on_every_page(db, packet_bytes):
         b = after[page_no].get_pixmap(dpi=150)
         assert (a.width, a.height) == (b.width, b.height)
         assert a.samples == b.samples, f"page {page_no + 1} does not render identically"
+
+
+def test_an_over_long_document_does_not_sink_the_batch(db, k1_bytes):
+    """Failure is per document, which is this module's own contract.
+
+    The page cap used to raise BatchTooLarge from inside scrub_one, where it
+    escaped the per-document except and aborted the run: a batch of twenty-five
+    with one over-long file returned nothing and lost the other twenty-four.
+    """
+    batch = scrub_batch(
+        db,
+        [
+            ("good.pdf", k1_bytes),
+            ("long.pdf", repeat(k1_bytes, MAX_PAGES + 1)),
+        ],
+    )
+
+    assert [d.filename for d in batch.scrubbed] == ["good.pdf"]
+    assert [q.filename for q in batch.quarantined] == ["long.pdf"]
+    assert "DocumentTooLong" in batch.quarantined[0].reason
+
+
+def test_the_page_cap_raises_its_own_error(k1_bytes):
+    """Not BatchTooLarge, which is what made it escape the per-document except.
+
+    Checked straight out of scrub_one, since scrub_batch swallows it by design.
+    """
+    with pytest.raises(DocumentTooLong):
+        scrub_one(
+            repeat(k1_bytes, MAX_PAGES + 1),
+            "job", b"k" * 32, {}, set(), DEFAULT_POLICY, load_field_maps(),
+        )
