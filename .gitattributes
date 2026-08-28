@@ -1,0 +1,3 @@
+# Vendored, and its sha256 is recorded in the commit that added it. Line-ending
+# translation would rewrite the bytes on checkout and make that hash a lie.
+web/static/*.js -text
