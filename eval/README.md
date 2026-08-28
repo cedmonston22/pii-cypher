@@ -101,7 +101,7 @@ document, named `<document>.key.json`:
 
 ### What the corpus needs to cover
 
-The two shipped fixtures cannot test any of these:
+The two shipped fixtures cannot test these on their own:
 
 1. Template and fill in the **same font family**, separated only by size. This is
    the realistic case; the 2025 fixture separates cleanly only because its fill
@@ -117,5 +117,9 @@ The two shipped fixtures cannot test any of these:
    real validators — SSN area `000` and EIN prefix `00` are never issued — so
    neither can reach high confidence, and a quarantine gate keyed on high
    confidence cannot be calibrated on them at all.
-9. A multi-page document. `find_label` returns only the first match, so the
-   column gate on a continuation page with a different margin is untested.
+9. A multi-page document. Partly covered now: location is per instance, and the
+   tests build a three-partner packet from the fixture, so several K-1s in one
+   file are exercised end to end. What is still missing is the shape those
+   packets cannot make — a form whose *box* continues onto the next page, where
+   the column gate would meet a different margin. Every instance in the fixtures
+   starts a fresh page, so that gate has still never run.

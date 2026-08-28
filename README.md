@@ -153,6 +153,38 @@ to that label.
 A new form family still needs a map. What it no longer needs is a new map every
 year.
 
+### Several forms in one file
+
+A firm exporting thirty K-1s sends one PDF. Each filled copy of the form is an
+**instance**, and a map declares the keyword that delimits one:
+
+```json
+{ "instance_anchor": "ssn or tin" }
+```
+
+Labels are then looked up *within* an instance, and still first-match inside it.
+Both halves are load-bearing. Without the scope, `find_label` returns partner
+1's line for all thirty and partners 2..N are never located — every release gate
+passes, because `verify_scrubbed` searches for the values it was handed and it
+was never handed theirs, so the file ships reported as scrubbed with their
+identifiers on the page. Without first-match, `name address city state and ZIP
+code` matches field B *and* field F, and the partner's home address gets located
+a second time as the partnership's.
+
+Not every keyword can be an anchor. It has to occur exactly once per form: on a
+K-1 `ssn or tin` does, the address keyword occurs twice, and the identify
+markers occur two or three times on a single page.
+
+A map that declares no anchor, or a file with fewer than two occurrences of one,
+is a single instance spanning every page — which is what every map meant before
+instances existed. So a one-page document and a single K-1 spanning twenty pages
+are unaffected, and the value repeats that `propagate` was already sweeping up
+still work the same way.
+
+Boundaries are page-granular, which suits a full-page form. Pages ahead of the
+first anchor — a transmittal sheet — join the first instance rather than falling
+out of every lookup.
+
 ## The coverage layer
 
 After location, `detect/` scans the page for PII the field map did not claim and
@@ -299,6 +331,15 @@ info dictionary, XMP metadata, embedded files, or annotations. In a real firm's 
 **No cross-document value hunting.** A value located in document A is not searched for
 in document B where B's map does not cover it.
 
+**Two instances on one physical page are not separated.** Segmentation is
+page-granular. A K-1 is a full-page form, so this is not the shape a firm sends;
+if it happens, detection reports the second copy as a coverage gap rather than
+the document quietly shipping.
+
+**A field whose value wraps onto the next page is out of scope.** `discover_field`
+searches the label's own page. Instances may span pages — the anchor opens one
+and it runs to the next anchor — but a single box may not.
+
 **Cross-job token collisions are theoretically possible.** Tokens are 8
 characters from a 32-symbol alphabet and are minted with a uniqueness check
 *within* a job only. A collision across jobs is about 1 in 10^12 per pair, and a
@@ -319,7 +360,7 @@ reach that bar.
 ```
 core/
   extract.py    PDF bytes -> positioned line segments (row grouping + gap splitting)
-  fieldmap.py   normalize(), identify(), find_label(), discover_field(), locate()
+  fieldmap.py   normalize(), identify(), segment(), find_label(), discover_field(), locate()
   piitypes.py   the canonical PII type vocabulary
   tokens.py     minting, batch-wide assignment, discovery regex
   keys.py       wrap / unwrap            <- the only file a KMS swap touches
@@ -355,5 +396,11 @@ carried-forward precision and recall lists in `test_detect_patterns.py`; AAD mis
 raw-file scan proving no plaintext reaches the database in `test_vault.py`; style
 fidelity in `test_redact.py`; and in `test_pipeline.py`, that a partner shared across
 a 2021 and a 2025 K-1 collapses to one token, and that both restore pixel-identically.
+
+For packets, `test_fieldmap.py` pins the segmentation and the field B/F collision
+that keeps lookup first-match; `test_detect_coverage.py` pins that three K-1s in
+one file still produce no warnings at all; and `test_pipeline.py` scrubs a
+three-partner packet end to end and compares **every** page rasterised, not just
+the first.
 
 Fixtures are synthetic. Never point this at a real K-1 while developing.
