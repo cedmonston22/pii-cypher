@@ -15,7 +15,11 @@ pip install -r requirements-dev.txt
 ./run.sh          # or .\run.ps1 on Windows  ->  http://127.0.0.1:8000
 ```
 
-`run.sh` generates key material into `.env.local` on first run and reuses it after.
+`run.sh` calls `python cli.py init`, which generates key material on a genuinely new
+install and reuses it after. The vault and that key file live in the per-user
+application data directory (`%LOCALAPPDATA%\pii-cypher\` on Windows), not in the
+checkout, so the tool finds the same vault whatever directory you launch it from.
+`python cli.py status` prints the location and how it was chosen.
 **Deleting that file makes every existing job permanently unreadable** —
 `PII_MASTER_KEY` wraps each job's data key. Both variables are base64-encoded 32-byte
 values if you prefer to set them yourself.
@@ -31,6 +35,65 @@ python cli.py restore scrubbed/*.pdf --out restored.zip   # no job id needed
 `scrub` and `restore` exit non-zero when any file was quarantined, any token failed
 to resolve, or the audit flagged uncovered PII — so a script cannot mistake a
 partial run for a clean one.
+
+## Where the vault lives
+
+By default the vault and its key file sit in the per-user application data directory
+(`%LOCALAPPDATA%\pii-cypher\` on Windows). `python cli.py status` prints the path, how
+it was chosen, and whether this machine's keys actually decrypt it.
+
+The location can be changed from **Settings** in the web app, or from the command line:
+
+```bash
+python cli.py move  D:\firm-data\vault.db    # copy the vault there and remember it
+python cli.py use   D:\firm-data\vault.db    # switch to a vault already there
+python cli.py forget                          # go back to the default location
+```
+
+Two actions rather than one path field, because they are different operations and each
+refuses the other's situation. **Move** copies the current vault, verifies the copy
+decrypts, records the choice, and keeps the original under a dated name — it refuses a
+destination that already holds jobs. **Use** switches to a vault that is already there
+and copies nothing — it refuses a path that is empty or absent. Neither can quietly do
+the other's job, which is what stops a mistyped path from silently producing a
+fully-formed empty vault that then reports zero jobs.
+
+Six things decide the location, in order:
+
+| | Source | |
+|---|---|---|
+| 1 | `--db` | one command only |
+| 2 | `PII_VAULT_DB` | a file, for one process |
+| 3 | `PII_VAULT_DIR` | a directory, what a server deployment sets |
+| 4 | the saved setting | what Settings / `move` / `use` write |
+| 5 | a `vault.db` in the working directory | pre-move installs, with a warning |
+| 6 | the per-user default | |
+
+The environment outranks the saved setting on purpose, so a deliberate per-process launch
+decision always wins. The saved setting outranks a `vault.db` in the working directory,
+also on purpose: without that, choosing a new location from a checkout that still has its
+own vault would have no effect and say nothing about it.
+
+### The key file does not move with the vault
+
+It stays in the per-user directory. A vault on another drive is therefore inert to anyone
+who has not been given the two keys, so a copied folder or a swept-up backup yields
+nothing. The same fact has a second edge: **you cannot read that vault from another
+machine, and a colleague cannot read it at all, until those keys are copied there.**
+
+```bash
+python cli.py backup D:\vault-backup.db   # prints both keys
+```
+
+Paste the two lines it prints into the other machine's key file (the path `status`
+reports) or set them as environment variables. Understand what that grants: there is one
+master key per vault and restore does not need a job id, so those two strings open
+**everything** in that vault, not one client's documents. There is no way to share part
+of a vault.
+
+A network path is allowed and warned about rather than refused. SQLite's file locking is
+unreliable over SMB and WAL is unavailable there, so two machines writing at once risks
+corrupting the vault; one machine at a time is genuinely fine.
 
 ## How it works
 
@@ -363,9 +426,12 @@ core/
   fieldmap.py   normalize(), identify(), segment(), find_label(), discover_field(), locate()
   piitypes.py   the canonical PII type vocabulary
   tokens.py     minting, batch-wide assignment, discovery regex
-  keys.py       wrap / unwrap            <- the only file a KMS swap touches
+  keys.py       wrap / unwrap, secret resolution   <- the only file a KMS swap touches
   crypto.py     AAD, encrypt / decrypt, token hashing
   vault.py      SQLite: jobs, documents, vault_entries, job_keys
+  paths.py      where the vault lives, answered in one place
+  config.py     the settings file; knows nothing about where it sits
+  relocate.py   moving and adopting vaults, and what both refuse
   redact.py     tokens in, values back out, styling preserved
   verify.py     the release gates
   pipeline.py   scrub_batch(), restore_batch(), match_document()
