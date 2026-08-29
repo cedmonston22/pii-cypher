@@ -7,6 +7,9 @@ import pymupdf
 import pytest
 from fastapi.testclient import TestClient
 
+from core import keys, paths, relocate, vault
+from core.crypto import LOOKUP_SECRET_ENV
+from core.keys import MASTER_KEY_ENV, generate_data_key, wrap
 from core.verify import extract_all_text
 from tests.test_pipeline import K1_VALUES, NAMES_KEPT
 
@@ -290,3 +293,221 @@ def test_a_client_that_sends_no_policy_still_gets_the_default(client, k1_bytes):
     _, text = _scrubbed_text(client, k1_bytes, None)
     for value in K1_VALUES:
         assert value not in text
+
+
+class TestCrossSiteRequests:
+    """The app has no authentication, so the origin is the only thing
+    distinguishing the user's own form from another site's."""
+
+    def test_a_foreign_origin_is_refused(self, client, k1_bytes):
+        response = client.post(
+            "/scrub",
+            files=[("files", ("k1.pdf", k1_bytes, "application/pdf"))],
+            headers={"origin": "http://evil.example"},
+        )
+
+        assert response.status_code == 403
+
+    def test_restore_is_covered_too(self, client, k1_bytes):
+        response = client.post(
+            "/restore",
+            files=[("files", ("k1.pdf", k1_bytes, "application/pdf"))],
+            headers={"origin": "http://evil.example"},
+        )
+
+        assert response.status_code == 403
+
+    def test_the_apps_own_origin_is_allowed(self, client, k1_bytes):
+        response = client.post(
+            "/scrub",
+            files=[("files", ("k1.pdf", k1_bytes, "application/pdf"))],
+            headers={"origin": "http://testserver"},
+        )
+
+        assert response.status_code == 200
+
+    def test_no_origin_at_all_is_allowed(self, client, k1_bytes):
+        """A non-browser client. Browsers always send the header on a
+        cross-origin form POST, so allowing this does not open the case the
+        check exists for -- and it is what keeps curl and the CLI working."""
+        response = client.post(
+            "/scrub", files=[("files", ("k1.pdf", k1_bytes, "application/pdf"))]
+        )
+
+        assert response.status_code == 200
+
+
+@pytest.fixture
+def settings_client(tmp_path, monkeypatch):
+    """A client where the settings tier is actually reachable.
+
+    The plain `client` fixture sets PII_VAULT_DB, which deliberately outranks a
+    saved setting -- every assertion about settings would pass vacuously under
+    it. data_dir is patched rather than PII_VAULT_DIR set, for the same reason:
+    that variable occupies a higher precedence slot too.
+    """
+    home = tmp_path / "home"
+    work = tmp_path / "work"
+    work.mkdir()
+    monkeypatch.delenv("PII_VAULT_DB", raising=False)
+    monkeypatch.delenv(paths.VAULT_DIR_ENV, raising=False)
+    monkeypatch.setattr(paths, "data_dir", lambda: home)
+    monkeypatch.chdir(work)
+    keys.clear_cache()
+
+    from web import app as app_module
+
+    return TestClient(app_module.app), home, tmp_path
+
+
+def _make_vault(db_path, filename="Smith_John_K1.pdf"):
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = vault.connect(db_path)
+    job_key = generate_data_key()
+    job_id = vault.create_job(conn, {"pii_types": ["EIN"]})
+    vault.store_key(conn, job_id, wrap(job_key))
+    vault.store_document(conn, job_id, filename, job_key, status="scrubbed")
+    conn.commit()
+    conn.close()
+    return job_id
+
+
+class TestSettingsPage:
+    def test_shows_the_current_vault_and_that_keys_stay_behind(self, settings_client):
+        client, home, _ = settings_client
+
+        body = client.get("/settings").text
+
+        assert str(home / paths.DB_FILENAME) in body
+        assert "key file does not move with the vault" in body
+        assert str(paths.env_file_path()) in body
+
+    def test_a_preview_changes_nothing(self, settings_client):
+        client, home, tmp_path = settings_client
+        _make_vault(home / paths.DB_FILENAME)
+        destination = tmp_path / "elsewhere" / "firm.db"
+
+        body = client.post(
+            "/settings", data={"action": "move", "path": str(destination)}
+        ).text
+
+        assert "Confirm" in body
+        assert not destination.exists()
+        assert paths.configured_db_path() is None
+
+    def test_a_confirmed_move_takes_effect_with_no_restart(self, settings_client):
+        """The property the whole design leans on: _db() resolves per request,
+        so nothing is cached and the running process follows the new setting.
+
+        Asserting the job survives is what proves it: had resolution not moved,
+        /jobs would have created a fresh empty vault at the old path and shown
+        nothing, because the original is renamed as part of the move.
+        """
+        client, home, tmp_path = settings_client
+        job_id = _make_vault(home / paths.DB_FILENAME)
+        destination = tmp_path / "elsewhere" / "firm.db"
+        assert job_id in client.get("/jobs").text
+
+        response = client.post(
+            "/settings", data={"action": "move-confirm", "path": str(destination)}
+        )
+
+        assert response.status_code == 200
+        assert paths.configured_db_path() == destination
+        assert relocate.count_jobs(destination) == 1
+        # The same running process, no reload: the job is still listed, and it
+        # can only be coming from the new file because the old one was renamed.
+        assert job_id in client.get("/jobs").text
+        assert not (home / paths.DB_FILENAME).exists()
+
+    def test_a_rejected_path_keeps_what_was_typed(self, settings_client):
+        client, home, tmp_path = settings_client
+        _make_vault(home / paths.DB_FILENAME)
+
+        response = client.post(
+            "/settings", data={"action": "move", "path": str(tmp_path)}
+        )
+
+        assert response.status_code == 400
+        assert "looks like a folder" in response.text
+        assert str(tmp_path) in response.text
+
+    def test_a_relative_path_is_refused(self, settings_client):
+        """It would follow the working directory, which is the bug the fixed
+        location exists to close -- and a settings page is exactly where it
+        would otherwise get back in."""
+        client, home, _ = settings_client
+        _make_vault(home / paths.DB_FILENAME)
+
+        response = client.post(
+            "/settings", data={"action": "move", "path": "data/vault.db"}
+        )
+
+        assert response.status_code == 400
+        assert "not a full path" in response.text
+        assert paths.configured_db_path() is None
+
+    def test_adopting_a_vault_this_machine_cannot_decrypt_is_refused(
+        self, settings_client, monkeypatch
+    ):
+        """A vault built under other key material opens and lists jobs happily.
+        Accepting it would mean every restore failing later with nothing to
+        explain why."""
+        client, home, tmp_path = settings_client
+        foreign = tmp_path / "shared" / "vault.db"
+        _make_vault(foreign)
+        monkeypatch.setenv(MASTER_KEY_ENV, __import__("base64").b64encode(b"z" * 32).decode())
+        keys.clear_cache()
+
+        response = client.post("/settings", data={"action": "use", "path": str(foreign)})
+
+        assert response.status_code == 400
+        assert "cli.py backup" in response.text
+        assert paths.configured_db_path() is None
+
+    def test_adopting_an_empty_vault_points_at_the_other_action(self, settings_client):
+        client, home, tmp_path = settings_client
+        empty = tmp_path / "shared" / "vault.db"
+        empty.parent.mkdir(parents=True)
+        vault.connect(empty).close()
+
+        response = client.post("/settings", data={"action": "use", "path": str(empty)})
+
+        assert response.status_code == 400
+        assert "Use Move" in response.text
+
+    def test_forget_clears_a_dangling_setting(self, settings_client):
+        """The repair path: the drive is gone and the app will not start."""
+        client, home, tmp_path = settings_client
+        paths.set_configured_db(tmp_path / "removable" / "firm.db")
+        assert "not there" in client.get("/settings").text
+
+        response = client.post("/settings", data={"action": "forget"})
+
+        assert response.status_code == 200
+        assert paths.configured_db_path() is None
+
+    def test_an_unreadable_settings_file_still_renders_a_way_out(self, settings_client):
+        """Resolution refuses rather than falling through, so without this the
+        app could not be repaired from its own interface."""
+        client, home, _ = settings_client
+        paths.config_path().parent.mkdir(parents=True, exist_ok=True)
+        paths.config_path().write_text("{not json", encoding="utf-8")
+
+        body = client.get("/settings").text
+
+        assert "cannot be read" in body
+        assert "Clear the setting" in body
+
+    def test_a_foreign_origin_cannot_repoint_the_vault(self, settings_client, tmp_path):
+        client, home, _ = settings_client
+        _make_vault(home / paths.DB_FILENAME)
+
+        response = client.post(
+            "/settings",
+            data={"action": "move-confirm", "path": str(tmp_path / "evil" / "v.db")},
+            headers={"origin": "http://evil.example"},
+        )
+
+        assert response.status_code == 403
+        assert paths.configured_db_path() is None

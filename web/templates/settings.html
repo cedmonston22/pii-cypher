@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Settings</h1>
+<p class="lede">Where the vault file lives. Moving it never deletes anything &mdash; the
+previous file is kept under a dated name.</p>
+
+{% if notice %}
+<div class="callout"><strong>{{ notice }}</strong></div>
+{% endif %}
+
+{% if config_error %}
+<div class="callout bad">
+  <h2>The saved setting cannot be read</h2>
+  <p>{{ config_error }}</p>
+  <p class="hint">Nothing else on this page works until that is cleared, because the app
+     refuses to guess a different vault rather than quietly use the wrong one.</p>
+  <form action="/settings" method="post">
+    <input type="hidden" name="action" value="forget">
+    <button type="submit">Clear the setting</button>
+  </form>
+</div>
+{% else %}
+
+<div class="panel">
+  <h2>Current vault</h2>
+  <p class="mono">{{ vault.path }}</p>
+  <p class="hint">Located by: {{ vault.source }}{% if vault.chosen %} &mdash; set in
+     <span class="mono">{{ vault.config_path }}</span>{% endif %}</p>
+
+  {% if vault.state == 'ok' %}
+    <p>{{ vault.job_count }} job{{ '' if vault.job_count == 1 else 's' }}.
+       {% if vault.decrypts %}
+         This machine&rsquo;s keys open it.
+       {% else %}
+         <strong>This machine&rsquo;s keys do not open it</strong> ({{ vault.detail }}).
+       {% endif %}
+    </p>
+    {% if not vault.decrypts %}
+    <div class="callout bad">
+      <p>The vault opens but cannot be decrypted, so every restore will fail. It was
+         created under different key material.</p>
+    </div>
+    {% endif %}
+  {% elif vault.state == 'missing' %}
+    <div class="callout bad">
+      <p><strong>That file is not there.</strong> The drive may be disconnected, or the
+         vault may have been moved or deleted by something else.</p>
+      <form action="/settings" method="post">
+        <input type="hidden" name="action" value="forget">
+        <button type="submit">Clear the setting and use the default</button>
+      </form>
+    </div>
+  {% elif vault.state == 'foreign' %}
+    <div class="callout bad">
+      <p><strong>That file is not a pii-cypher vault.</strong> Nothing has been written to
+         it &mdash; point somewhere else below.</p>
+    </div>
+  {% else %}
+    <p>No vault yet. One is created here the first time you scrub something.</p>
+  {% endif %}
+</div>
+
+<div class="callout warn">
+  <p><strong>The key file does not move with the vault.</strong> It stays at
+     <span class="mono">{{ key_file }}</span>.</p>
+  <p class="hint">That is deliberate: a vault on another drive is unreadable to anyone who
+     has not been given the two keys, so a copied folder or a leaked backup is inert. It
+     also means you cannot read this vault from another machine until those keys are
+     copied there &mdash; <span class="mono">python cli.py backup</span> prints them, and
+     they grant access to everything in the vault, not part of it.</p>
+</div>
+
+{% if preview %}
+<div class="panel">
+  <h2>Confirm</h2>
+  {% for warning in preview.warnings %}
+  <div class="callout warn"><p>{{ warning }}</p></div>
+  {% endfor %}
+
+  {% if preview.action == 'move' %}
+    <p>Copy the vault and its {{ preview.job_count }}
+       job{{ '' if preview.job_count == 1 else 's' }} to a new file.</p>
+    <table>
+      <tr><th>From</th><td class="mono">{{ preview.source }}</td></tr>
+      <tr><th>To</th><td class="mono">{{ preview.destination }}</td></tr>
+    </table>
+    {% if preview.replacing_empty %}
+    <p class="hint">An empty vault already at that path will be replaced.</p>
+    {% endif %}
+    <p class="hint">The copy is verified before anything is switched over, and the original
+       is kept under a dated name.</p>
+  {% else %}
+    <p>Use the existing vault at <span class="mono">{{ preview.destination }}</span>,
+       holding {{ preview.job_count }} job{{ '' if preview.job_count == 1 else 's' }}.
+       Nothing is copied.</p>
+    <p class="hint">Checked: {{ preview.detail }}.</p>
+  {% endif %}
+
+  <form action="/settings" method="post">
+    <input type="hidden" name="action" value="{{ preview.action }}-confirm">
+    <input type="hidden" name="path" value="{{ typed }}">
+    <button type="submit">
+      {{ 'Move the vault' if preview.action == 'move' else 'Use this vault' }}
+    </button>
+  </form>
+  <p class="hint"><a href="/settings">Cancel</a></p>
+</div>
+{% else %}
+<form class="panel" action="/settings" method="post">
+  <h2>Point somewhere else</h2>
+  <label for="path">Full path to a vault file</label>
+  <input id="path" type="text" name="path" value="{{ typed }}" required
+         placeholder="D:\firm-data\vault.db" spellcheck="false">
+  <p class="hint">The whole path including the file name. A network drive works, with
+     caveats you will be shown before anything changes.</p>
+
+  <p><button type="submit" name="action" value="move">Move the vault here</button>
+     <button type="submit" name="action" value="use">Use a vault already here</button></p>
+
+  <p class="hint"><strong>Move</strong> copies the current vault to that file and keeps the
+     original. <strong>Use</strong> switches to a vault that is already there and copies
+     nothing. Each refuses the other&rsquo;s situation, so neither can quietly do the
+     wrong one.</p>
+</form>
+
+{% if vault and vault.chosen %}
+<form action="/settings" method="post">
+  <input type="hidden" name="action" value="forget">
+  <button type="submit">Forget this choice and use the default</button>
+</form>
+{% endif %}
+{% endif %}
+
+{% endif %}
+{% endblock %}
