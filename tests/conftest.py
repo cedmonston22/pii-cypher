@@ -16,6 +16,17 @@ def key_material():
     os.environ["PII_LOOKUP_SECRET"] = base64.b64encode(secrets.token_bytes(32)).decode()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def isolated_vault_dir(tmp_path_factory):
+    """Point the per-user vault location at a temporary directory.
+
+    Without this, a test that resolves the vault without being handed a path
+    reaches the developer's real one, and the suite passes or fails depending
+    on whose machine it runs on.
+    """
+    os.environ["PII_VAULT_DIR"] = str(tmp_path_factory.mktemp("vault-home"))
+
+
 @pytest.fixture(scope="session")
 def k1_bytes() -> bytes:
     """The 2021 Schedule K-1."""

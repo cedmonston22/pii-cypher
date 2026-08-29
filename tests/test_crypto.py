@@ -7,6 +7,18 @@ from core.crypto import aad, aad_filename, decrypt, encrypt, token_hash
 from core.keys import generate_data_key, unwrap, wrap
 
 
+def test_aad_bytes_are_frozen():
+    """Every stored GCM tag depends on these exact bytes.
+
+    The other AAD tests here assert only that different contexts differ, so all
+    of them would still pass if TENANT_ID changed from "local" to anything
+    else -- while every job already in the vault became undecryptable. Nothing
+    else in the suite would notice. This is what notices.
+    """
+    assert aad("job1", "ssn_tin", "PII-ABC23456") == b"local|job1|value|ssn_tin|PII-ABC23456"
+    assert aad_filename("job1", "doc1") == b"local|job1|filename|doc1"
+
+
 def test_key_wrap_round_trip():
     key = generate_data_key()
     assert len(key) == 32

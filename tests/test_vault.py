@@ -29,6 +29,17 @@ from core.vault import (
 POLICY = {"pii_types": ["EIN", "SSN", "ADDRESS"]}
 
 
+def test_connect_requires_an_explicit_path():
+    """No default, so a caller that forgets cannot bind to the wrong file.
+
+    Three modules used to carry their own "vault.db" literal and drifted apart,
+    which meant the tool silently opened a different vault depending on the
+    working directory. core.paths answers where; connect only opens.
+    """
+    with pytest.raises(TypeError):
+        connect()
+
+
 @pytest.fixture
 def db(tmp_path):
     return connect(str(tmp_path / "vault.db"))

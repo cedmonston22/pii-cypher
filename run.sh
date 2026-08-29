@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 # Starts the PII Scrubber locally. See run.ps1 for the PowerShell equivalent.
 #
-# Key material is generated once into .env.local and reused. Deleting that file
-# makes every existing job permanently unreadable.
+# The vault and its key material live in the per-user application data
+# directory, not in this checkout. `python cli.py status` prints where.
+#
+# Key generation is `cli.py init`'s job and nowhere else. This script used to
+# generate whenever .env.local was absent, which is the wrong condition: a
+# fresh clone next to an existing vault minted a new master key and made every
+# job in that vault permanently unreadable. init refuses when a vault it
+# cannot read is present.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-if [ ! -f .env.local ]; then
-  echo "Generating key material into .env.local (first run)"
-  {
-    echo "PII_MASTER_KEY=$(python -c 'import secrets,base64;print(base64.b64encode(secrets.token_bytes(32)).decode())')"
-    echo "PII_LOOKUP_SECRET=$(python -c 'import secrets,base64;print(base64.b64encode(secrets.token_bytes(32)).decode())')"
-  } > .env.local
+# A checkout that has not been migrated still keeps its keys here. The
+# environment wins over the key file, so sourcing this keeps such an install
+# working until `python cli.py migrate` moves it.
+if [ -f .env.local ]; then
+  set -a; . ./.env.local; set +a
 fi
 
-set -a; . ./.env.local; set +a
+python cli.py init --quiet
 
 echo
 echo "  PII Scrubber -> http://127.0.0.1:8000"

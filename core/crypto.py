@@ -7,14 +7,13 @@ cannot be decrypted in the context of another -- GCM will reject the tag.
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import hmac
 import os
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from core.keys import MissingKeyMaterial
+from core.keys import load_secret
 
 TENANT_ID = "local"
 LOOKUP_SECRET_ENV = "PII_LOOKUP_SECRET"
@@ -57,10 +56,13 @@ def decrypt(job_key: bytes, ciphertext: bytes, nonce: bytes, associated: bytes) 
 
 
 def _lookup_secret() -> bytes:
-    raw = os.environ.get(LOOKUP_SECRET_ENV)
-    if not raw:
-        raise MissingKeyMaterial(f"{LOOKUP_SECRET_ENV} is not set")
-    return base64.b64decode(raw)
+    """Resolve the HMAC key, with no length requirement.
+
+    The master key must be exactly 32 bytes; this one deliberately is not
+    checked. Imposing a length retroactively would lock someone out of a
+    working vault whose lookup secret was set by hand at another size.
+    """
+    return load_secret(LOOKUP_SECRET_ENV)
 
 
 def token_hash(token: str) -> str:

@@ -12,6 +12,7 @@ lookup was never document-scoped to begin with.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -95,7 +96,14 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def connect(path: str = "vault.db") -> sqlite3.Connection:
+def connect(path: str | os.PathLike[str]) -> sqlite3.Connection:
+    """Open the vault at ``path``.
+
+    Deliberately has no default. Three modules used to carry their own
+    "vault.db" literal and they drifted apart; a caller that forgets is now a
+    TypeError at the call site rather than a fourth silent divergence.
+    ``core.paths`` is what answers where.
+    """
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
@@ -167,6 +175,23 @@ def list_jobs(conn: sqlite3.Connection, limit: int = 50) -> list[dict[str, Any]]
         }
         for r in rows
     ]
+
+
+def count_jobs(conn: sqlite3.Connection) -> int:
+    """Total jobs, expired ones included. What `status` reports."""
+    return conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+
+
+def snapshot(conn: sqlite3.Connection, destination: str | os.PathLike[str]) -> None:
+    """Write a consistent, compacted copy of the vault.
+
+    VACUUM INTO rather than a file copy: it cannot capture a torn file while the
+    web app is mid-write, and it drops free pages, so ciphertext from rows that
+    are gone does not ride along into a backup.
+
+    SQLite requires the destination not to exist.
+    """
+    conn.execute("VACUUM INTO ?", (str(destination),))
 
 
 def store_key(conn: sqlite3.Connection, job_id: str, wrapped_key: bytes) -> None:
