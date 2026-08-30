@@ -45,10 +45,6 @@
   .lands .pair { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
   .lands .arrow { color:var(--muted); }
   .lands .note { font-size:12px; color:var(--muted); margin:5px 0 14px; }
-  .said { border-left:2px solid var(--caution-line); padding:2px 0 2px 13px; margin:0 0 12px; }
-  .said p { font-family:var(--serif); font-size:15px; line-height:1.5; margin:0; color:var(--ink-2); }
-  .said p + p { margin-top:9px; }
-  .fineprint { font-size:12.5px; line-height:1.5; color:var(--muted); margin:0; }
 
   /* ------------------------------- dropzone ------------------------------ */
   .dropzone {
@@ -109,7 +105,7 @@
   <!-- ============================== sidebar ============================== -->
   <aside class="card">
     <div class="policy-head">
-      <h2>Policy</h2>
+      <h2>Filters</h2>
       <p>Applies to every file in this batch.</p>
     </div>
 
@@ -166,7 +162,7 @@
     </table>
 
     <div class="lands">
-      <p class="cap">What lands on the page</p>
+      <p class="cap">Examples of show last</p>
       <div class="pair">
         <span class="chip">45-1234567</span>
         <span class="arrow" aria-hidden="true">&rarr;</span>
@@ -180,30 +176,19 @@
       </div>
       <p class="note">show last: 4</p>
 
-      <div class="said">
-        <p>An SSN and an EIN are nine digits, so showing <u>six</u> of them hides three.
-           At the top of the range this is closer to disclosure than to redaction.</p>
-        <p>Unticking a type leaves that identifier readable on the delivered document.</p>
-      </div>
-
-      <div class="callout warn" x-cloak x-show="loudReveal" style="margin:0 0 12px; padding:11px 13px;">
+      <div class="callout warn" x-cloak x-show="loudReveal" style="margin:0; padding:11px 13px;">
         <strong style="font-size:13.5px;">You are revealing <span x-text="loudReveal"></span> digits.</strong>
         <p class="hint" style="margin-top:2px;">Of nine. The recipient can match the value against
            their own records &mdash; which may be the point, but it is a disclosure.</p>
       </div>
-
-      <p class="fineprint">Names are deliberately out of policy and stay on the form &mdash; the
-        recipient still has to know whose K-1 this is. The value is encrypted whole either way,
-        and restores whole.</p>
     </div>
   </aside>
 
   <!-- =============================== main ================================ -->
   <div>
     <h1>Scrub a batch</h1>
-    <p class="lede">Identifiers are replaced with tokens and the originals encrypted under a key
-      belonging to this batch, so they can be restored later. Uploaded bytes are never written
-      to disk.</p>
+    <p class="lede">Identifiers become tokens. The originals are encrypted and restorable
+      later.</p>
 
     {#  The real control. Alpine keeps input.files in step with its own list so
         Remove works, but the form still submits as an ordinary multipart POST --
