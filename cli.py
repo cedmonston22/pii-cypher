@@ -186,9 +186,38 @@ def _generate() -> str:
     return base64.b64encode(secrets.token_bytes(KEY_LEN)).decode()
 
 
-def _write_key_file(path: Path, master: str, lookup: str) -> None:
+def _write_key_file(
+    path: Path, master: str, lookup: str, carry_over: dict[str, str] | None = None
+) -> None:
+    """Set the two vault secrets, preserving anything else in the file.
+
+    This used to write exactly two lines, which silently discarded every other
+    key. That is survivable only while the vault secrets are the only things
+    living here, and nothing guarantees they stay that way: ``migrate`` calls
+    this, so any other secret in the file would be destroyed as a side effect of
+    moving a vault.
+
+    ``carry_over`` is for ``migrate``, whose destination file does not exist yet
+    -- the secrets to preserve are in the *source*, so reading the destination
+    alone would find nothing to keep and drop them just as silently.
+
+    A file that cannot be parsed is refused rather than replaced -- the rule
+    ``read_key_file`` already follows, and for the same reason: overwriting is
+    how key material that was merely misspelled becomes key material that is
+    gone.
+    """
+    existing = dict(keys.read_key_file(path))
+    existing.update(carry_over or {})
+    existing[MASTER_KEY_ENV] = master
+    existing[LOOKUP_SECRET_ENV] = lookup
+
+    # The two vault secrets lead, then whatever else was already there, so the
+    # file a user opens still reads the way it always has.
+    ordered = [MASTER_KEY_ENV, LOOKUP_SECRET_ENV]
+    ordered += [name for name in existing if name not in ordered]
+
     path.write_text(
-        f"{MASTER_KEY_ENV}={master}\n{LOOKUP_SECRET_ENV}={lookup}\n",
+        "".join(f"{name}={existing[name]}\n" for name in ordered),
         encoding="utf-8",
     )
     if os.name == "posix":
@@ -491,7 +520,9 @@ def cmd_migrate(args: argparse.Namespace) -> int:
         vault.snapshot(conn, dest_db)
     finally:
         conn.close()
-    _write_key_file(dest_keys, values[MASTER_KEY_ENV], values[LOOKUP_SECRET_ENV])
+    _write_key_file(
+        dest_keys, values[MASTER_KEY_ENV], values[LOOKUP_SECRET_ENV], carry_over=values
+    )
 
     # ambient_keys=False because migrate relocates the key file too, so the
     # copy must be checked the way the migrated install will read it rather

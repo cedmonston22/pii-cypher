@@ -195,6 +195,26 @@ class TestMigrate:
         out = capsys.readouterr().out
         assert "decrypted a filename" in out
 
+    def test_it_carries_across_secrets_it_does_not_own(self, checkout, home):
+        """The key file need not hold only our two secrets, and migrate must not
+        empty it on the way past.
+
+        _write_key_file used to write exactly two lines, so moving a vault
+        destroyed anything else in the file as a side effect."""
+        directory, _ = checkout
+        source = directory / paths.ENV_FILENAME
+        source.write_text(
+            source.read_text(encoding="utf-8") + "PII_OTHER_SECRET=keep-me\n",
+            encoding="utf-8",
+        )
+        keys.clear_cache()
+
+        assert cli.main(["migrate"]) == 0
+
+        values = keys.read_key_file(home / paths.ENV_FILENAME)
+        assert values["PII_OTHER_SECRET"] == "keep-me"
+        assert values[MASTER_KEY_ENV] == MASTER
+
     def test_the_migrated_vault_reads_without_any_ambient_key_material(self, checkout, home, monkeypatch):
         """The point of the move: a plain terminal can open it.
 
