@@ -52,6 +52,16 @@ class AdoptPlan(NamedTuple):
     detail: str
 
 
+class Choice(NamedTuple):
+    """What pointing at a path should actually do, and the facts behind it."""
+
+    action: str  # "copy" | "switch" | "start" | "ask"
+    source: Path
+    destination: Path
+    source_jobs: int
+    destination_jobs: int
+
+
 @contextlib.contextmanager
 def without_ambient_keys() -> Iterator[None]:
     """Hide exported key material so only the key file on disk is consulted."""
@@ -140,6 +150,56 @@ def verify_decryptable(
             return False, f"{type(exc).__name__}: {exc}"
         finally:
             conn.close()
+
+
+def plan_choice(source: Path, destination: Path) -> Choice:
+    """Work out what pointing at ``destination`` should do, rather than asking.
+
+    Copying your data somewhere and switching to data already there are genuinely
+    different operations, but the path almost always settles which one applies.
+    Making someone pick the verb first asks them to know the answer before they
+    have been told what is at the other end -- and picking wrong is exactly the
+    accident the two operations exist to prevent.
+
+    Only one case is really ambiguous: both ends hold data. That one is worth a
+    question, and by then it can be asked with real numbers in it.
+    """
+    if destination.exists() and not looks_like_a_vault(destination):
+        raise RelocateRefused(
+            f"{destination} already exists and is not a PII Scrubber database. "
+            "Choose another name rather than overwriting it."
+        )
+
+    destination_jobs = count_jobs(destination) if looks_like_a_vault(destination) else 0
+    source_jobs = count_jobs(source) if looks_like_a_vault(source) else 0
+
+    if destination_jobs and source_jobs:
+        action = "ask"
+    elif destination_jobs:
+        action = "switch"
+    elif source_jobs:
+        action = "copy"
+    else:
+        # Nothing anywhere: a fresh install choosing where its data will go.
+        # This does create an empty database later, which is the outcome the
+        # two-action split exists to prevent -- but only when there is nothing
+        # to lose, and the page says so before it happens. Explicit is fine;
+        # silent is the bug.
+        action = "start"
+
+    return Choice(
+        action=action,
+        source=source,
+        destination=destination,
+        source_jobs=source_jobs,
+        destination_jobs=destination_jobs,
+    )
+
+
+def set_location(destination: Path) -> None:
+    """Record a location with nothing to copy into it."""
+    paths.ensure_dir(destination.parent)
+    paths.set_configured_db(destination)
 
 
 def plan_move(source: Path, destination: Path) -> MovePlan:

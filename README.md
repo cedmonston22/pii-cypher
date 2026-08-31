@@ -445,7 +445,10 @@ detect/
   policy.py     which types, and the floor that cannot be switched off
 forms/          concept maps, one JSON per form family
 eval/           per-type recall and review rate; the corpus and its answer keys
-web/            FastAPI app and templates
+web/
+  app.py        routes, download custody
+  picker.py     the native file dialog
+  templates/
 cli.py          command line harness over the same pipeline functions
 ```
 

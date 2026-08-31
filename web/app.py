@@ -10,6 +10,7 @@ only long enough for the browser to fetch them.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import secrets
 import time
@@ -18,9 +19,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from core import paths, relocate, vault
 from core.config import ConfigError
@@ -40,6 +42,7 @@ from core.pipeline import (
 )
 from core.tokens import MAX_REVEAL_DIGITS
 from detect.policy import resolve_reveal
+from web import picker
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -71,12 +74,14 @@ CAPS = {
     "max_pages": MAX_PAGES,
 }
 
+
 app = FastAPI(title="PII Scrubber")
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 # Alpine is vendored rather than pulled from a CDN: the tool is meant to run
 # offline on a firm's own machine, and a scrubbing UI that silently depends on
 # a third party at page load is the wrong trade.
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
 
 @dataclass(frozen=True, slots=True)
 class Pending:
@@ -107,6 +112,7 @@ def same_origin(request: Request) -> None:
     the test suite -- and browsers always send the header on a cross-origin form
     POST, so the case this exists for is covered. It is not full CSRF protection
     and should not be described as such.
+
     """
     origin = request.headers.get("origin")
     if origin is None:
@@ -331,6 +337,48 @@ def _settings_context(**overrides) -> dict:
     return {**context, **overrides}
 
 
+# The picker draws a window on the desktop of whatever machine runs this
+# process. Here that is the user's own machine; anywhere else it is nobody's.
+LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+@app.post("/settings/browse", response_class=HTMLResponse, dependencies=[Depends(same_origin)])
+async def settings_browse(request: Request, path: str = Form(default="")):
+    """Open a native file dialog and put the result into the form.
+
+    Loopback only: on a shared server this would block a worker thread behind a
+    modal nobody can see. Browsing only fills the field -- Move and Use still
+    have to be pressed -- so the dialog cannot itself change where anything
+    lives.
+    """
+    client = request.client.host if request.client else None
+    if client not in LOOPBACK:
+        raise HTTPException(status_code=403, detail="the file picker is local only")
+
+    try:
+        current, _ = paths.resolve_db()
+        initial = current.parent if current.parent.is_dir() else None
+    except ConfigError:
+        initial = None
+
+    try:
+        # Off the event loop: the dialog blocks until the user answers it.
+        chosen = await asyncio.to_thread(picker.choose_database_path, initial)
+    except picker.DialogUnavailable as exc:
+        return templates.TemplateResponse(
+            request,
+            "settings.html",
+            _settings_context(
+                typed=path,
+                error=f"The file picker could not open ({exc}). Type the path instead.",
+            ),
+        )
+
+    return templates.TemplateResponse(
+        request, "settings.html", _settings_context(typed=chosen or path)
+    )
+
+
 @app.get("/settings", response_class=HTMLResponse)
 def settings(request: Request):
     return templates.TemplateResponse(request, "settings.html", _settings_context())
@@ -342,13 +390,18 @@ async def settings_change(
     action: str = Form(default=""),
     path: str = Form(default=""),
 ):
-    """Move the vault, adopt an existing one, or clear the setting.
+    """Change where the database lives.
+
+    The page asks for a location, not an operation. Copying data somewhere and
+    switching to data already there are genuinely different, but the path
+    settles which applies in every case except one -- both ends holding data --
+    and that case is asked about with real numbers rather than up front in
+    vocabulary nobody outside this codebase shares.
 
     Deliberately ``async``. ``scrub`` is also async and has no await between
-    resolving the vault and finishing the batch, so nothing else can be
+    resolving the database and finishing the batch, so nothing else can be
     scheduled in between. A sync handler here would run in the threadpool and
-    could interleave with that stretch, switching the vault out from under a
-    scrub that is mid-write.
+    could switch the database out from under a scrub that is mid-write.
     """
 
     def rejected(message: str):
@@ -359,32 +412,14 @@ async def settings_change(
             status_code=400,
         )
 
-    def preview_of(action_name, destination, job_count, *, source=None, detail=None,
-                   replacing_empty=False, warnings=()):
+    def rendered(**overrides):
         return templates.TemplateResponse(
-            request,
-            "settings.html",
-            _settings_context(
-                typed=path,
-                preview={
-                    "action": action_name,
-                    "source": str(source) if source else None,
-                    "destination": str(destination),
-                    "job_count": job_count,
-                    "detail": detail,
-                    "replacing_empty": replacing_empty,
-                    "warnings": list(warnings),
-                },
-            ),
+            request, "settings.html", _settings_context(**overrides)
         )
 
     if action == "forget":
         paths.clear_configured_db()
-        return templates.TemplateResponse(
-            request,
-            "settings.html",
-            _settings_context(notice="Setting cleared. The vault is back at the default location."),
-        )
+        return rendered(notice="Location cleared. The database is back in its default place.")
 
     try:
         destination, warnings = paths.validate_vault_path(path)
@@ -392,33 +427,46 @@ async def settings_change(
         return rejected(str(exc))
 
     try:
-        if action == "move":
-            source, _ = paths.resolve_db()
-            plan = relocate.plan_move(source, destination)
-            return preview_of(
-                "move", plan.destination, plan.job_count, source=plan.source,
-                replacing_empty=plan.replacing_empty, warnings=warnings,
+        source, _ = paths.resolve_db()
+
+        if action == "choose":
+            choice = relocate.plan_choice(source, destination)
+            if choice.action == "switch":
+                # Prove the keys open it before offering it as a choice at all.
+                relocate.plan_adopt(destination)
+            return rendered(
+                typed=path,
+                preview={
+                    "action": choice.action,
+                    "source": str(choice.source),
+                    "destination": str(choice.destination),
+                    "source_jobs": choice.source_jobs,
+                    "destination_jobs": choice.destination_jobs,
+                    "warnings": list(warnings),
+                },
             )
-        if action == "move-confirm":
-            source, _ = paths.resolve_db()
+
+        if action == "copy-confirm":
             result = relocate.move_vault(source, destination)
             notice = (
-                f"The vault is now at {result.destination}. "
+                f"The database is now at {result.destination}. "
                 f"The previous file is kept as {result.kept.name}."
             )
-        elif action == "use":
-            plan = relocate.plan_adopt(destination)
-            return preview_of("use", plan.path, plan.job_count, detail=plan.detail,
-                              warnings=warnings)
-        elif action == "use-confirm":
+        elif action == "switch-confirm":
             plan = relocate.adopt_vault(destination)
-            notice = f"Now using the vault at {plan.path}, holding {plan.job_count} job(s)."
+            notice = (
+                f"Now using the database at {plan.path}, "
+                f"holding {plan.job_count} job(s). Nothing was copied."
+            )
+        elif action == "start-confirm":
+            relocate.set_location(destination)
+            notice = f"New work will be saved to {destination}."
         else:
-            return rejected("Choose either Move or Use.")
+            return rejected("Choose a location and press Use this location.")
     except (RelocateRefused, ConfigError) as exc:
         return rejected(str(exc))
 
-    return templates.TemplateResponse(request, "settings.html", _settings_context(notice=notice))
+    return rendered(notice=notice)
 
 
 @app.get("/restore", response_class=HTMLResponse)
@@ -489,10 +537,16 @@ async def restore(request: Request, files: list[UploadFile] = None):
 
 @app.get("/download/{token}")
 def download(token: str):
-    """Hand over an archive once.
+    """Hand over an archive once, to the browser that asked for it.
+
+    Every refusal is the same 404 with the same message -- absent, expired, or
+    somebody else's. Distinguishing them would answer "does this token exist"
+    for anyone willing to ask repeatedly.
 
     The pop happens only after the entry has been accepted. Popping first would
     let anyone holding a guessed token destroy a download they cannot read.
+
+    Every refusal is the same 404 with the same message -- absent or expired.
     """
     _sweep(time.time())
     entry = _downloads.get(token)
@@ -505,6 +559,29 @@ def download(token: str):
         media_type="application/zip",
         headers={"Content-Disposition": f'attachment; filename="{entry.filename}"'},
     )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception(request: Request, exc: StarletteHTTPException):
+    """Render refusals as pages, not as raw JSON.
+
+    Starlette's exception rather than FastAPI's subclass, so an unmatched route
+    is caught too. Non-browser callers still get the JSON they can parse.
+    """
+    if "text/html" not in request.headers.get("accept", ""):
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    headings = {403: "Not allowed", 404: "Not found"}
+    return templates.TemplateResponse(
+        request,
+        "error.html",
+        {
+            "status": exc.status_code,
+            "heading": headings.get(exc.status_code, "Something went wrong"),
+            "detail": exc.detail,
+        },
+        status_code=exc.status_code,
+    )
+
 
 
 @app.get("/healthz")

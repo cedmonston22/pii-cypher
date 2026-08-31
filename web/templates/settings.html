@@ -1,8 +1,9 @@
 {% extends "base.html" %}
 {% block content %}
 <h1>Settings</h1>
-<p class="lede">Where the vault file lives. Moving it never deletes anything &mdash; the
-previous file is kept under a dated name.</p>
+<p class="lede">Where your data is saved. You will always be shown what is about to happen
+before anything changes, and nothing is ever deleted &mdash; the previous file is kept
+under a dated name.</p>
 
 {% if notice %}
 <div class="callout"><strong>{{ notice }}</strong></div>
@@ -10,123 +11,163 @@ previous file is kept under a dated name.</p>
 
 {% if config_error %}
 <div class="callout bad">
-  <h2>The saved setting cannot be read</h2>
+  <h2>The saved location cannot be read</h2>
   <p>{{ config_error }}</p>
   <p class="hint">Nothing else on this page works until that is cleared, because the app
-     refuses to guess a different vault rather than quietly use the wrong one.</p>
+     refuses to guess a different database rather than quietly use the wrong one.</p>
   <form action="/settings" method="post">
     <input type="hidden" name="action" value="forget">
-    <button type="submit">Clear the setting</button>
+    <button type="submit">Clear the saved location</button>
   </form>
 </div>
 {% else %}
 
 <div class="panel">
-  <h2>Current vault</h2>
+  <h2>Database</h2>
   <p class="mono">{{ vault.path }}</p>
   <p class="hint">Located by: {{ vault.source }}{% if vault.chosen %} &mdash; set in
      <span class="mono">{{ vault.config_path }}</span>{% endif %}</p>
+  {% if vault.source in ('PII_VAULT_DB', 'PII_VAULT_DIR') %}
+  <div class="callout warn">
+    <p>This location comes from the <span class="mono">{{ vault.source }}</span>
+       environment variable, which outranks anything saved here. Choosing a different
+       location below would copy your data and then carry on reading this one.</p>
+    <p class="hint">Clear the variable first, or change where it points.</p>
+  </div>
+  {% endif %}
 
   {% if vault.state == 'ok' %}
     <p>{{ vault.job_count }} job{{ '' if vault.job_count == 1 else 's' }}.
        {% if vault.decrypts %}
-         This machine&rsquo;s keys open it.
+         This computer&rsquo;s keys open it.
        {% else %}
-         <strong>This machine&rsquo;s keys do not open it</strong> ({{ vault.detail }}).
+         <strong>This computer&rsquo;s keys do not open it</strong> ({{ vault.detail }}).
        {% endif %}
     </p>
     {% if not vault.decrypts %}
     <div class="callout bad">
-      <p>The vault opens but cannot be decrypted, so every restore will fail. It was
-         created under different key material.</p>
+      <p>The database opens but cannot be decrypted, so every restore will fail. It was
+         created on a computer with different keys.</p>
     </div>
     {% endif %}
   {% elif vault.state == 'missing' %}
     <div class="callout bad">
       <p><strong>That file is not there.</strong> The drive may be disconnected, or the
-         vault may have been moved or deleted by something else.</p>
+         database may have been moved or deleted by something else.</p>
       <form action="/settings" method="post">
         <input type="hidden" name="action" value="forget">
-        <button type="submit">Clear the setting and use the default</button>
+        <button type="submit">Clear the saved location and use the default</button>
       </form>
     </div>
   {% elif vault.state == 'foreign' %}
     <div class="callout bad">
-      <p><strong>That file is not a pii-cypher vault.</strong> Nothing has been written to
-         it &mdash; point somewhere else below.</p>
+      <p><strong>That file is not a PII Scrubber database.</strong> Nothing has been
+         written to it &mdash; point somewhere else below.</p>
     </div>
   {% else %}
-    <p>No vault yet. One is created here the first time you scrub something.</p>
+    <p>No database yet. One is created here the first time you scrub something.</p>
   {% endif %}
 </div>
 
 <div class="callout warn">
-  <p><strong>The key file does not move with the vault.</strong> It stays at
-     <span class="mono">{{ key_file }}</span>.</p>
-  <p class="hint">That is deliberate: a vault on another drive is unreadable to anyone who
-     has not been given the two keys, so a copied folder or a leaked backup is inert. It
-     also means you cannot read this vault from another machine until those keys are
-     copied there &mdash; <span class="mono">python cli.py backup</span> prints them, and
-     they grant access to everything in the vault, not part of it.</p>
+  <p><strong>The keys stay on this computer.</strong> They are kept at
+     <span class="mono">{{ key_file }}</span> and do not travel with the database.</p>
+  <p class="hint">So a copy of the database on its own cannot be read by anyone &mdash; not
+     from a backup, not from a shared drive. It also means you cannot open it from another
+     computer until the keys are copied there too, which
+     <span class="mono">python cli.py backup</span> prints. Those keys open every document
+     in the database, so treat them as you would the documents themselves.</p>
 </div>
 
 {% if preview %}
 <div class="panel">
-  <h2>Confirm</h2>
+  <h2>Before anything changes</h2>
   {% for warning in preview.warnings %}
   <div class="callout warn"><p>{{ warning }}</p></div>
   {% endfor %}
 
-  {% if preview.action == 'move' %}
-    <p>Copy the vault and its {{ preview.job_count }}
-       job{{ '' if preview.job_count == 1 else 's' }} to a new file.</p>
+  {% if preview.action == 'copy' %}
+    <p>There is no database at that location yet, so your current one will be
+       <strong>copied</strong> there.</p>
     <table>
-      <tr><th>From</th><td class="mono">{{ preview.source }}</td></tr>
+      <tr><th>Move</th><td class="mono">{{ preview.source }}</td></tr>
       <tr><th>To</th><td class="mono">{{ preview.destination }}</td></tr>
+      <tr><th>Holding</th><td>{{ preview.source_jobs }}
+          job{{ '' if preview.source_jobs == 1 else 's' }}</td></tr>
     </table>
-    {% if preview.replacing_empty %}
-    <p class="hint">An empty vault already at that path will be replaced.</p>
-    {% endif %}
-    <p class="hint">The copy is verified before anything is switched over, and the original
-       is kept under a dated name.</p>
-  {% else %}
-    <p>Use the existing vault at <span class="mono">{{ preview.destination }}</span>,
-       holding {{ preview.job_count }} job{{ '' if preview.job_count == 1 else 's' }}.
+    <p class="hint">The copy is checked before anything switches over, and the original
+       stays where it is under a dated name.</p>
+    <form action="/settings" method="post">
+      <input type="hidden" name="action" value="copy-confirm">
+      <input type="hidden" name="path" value="{{ typed }}">
+      <button type="submit">Copy it there</button>
+    </form>
+
+  {% elif preview.action == 'switch' %}
+    <p>There is already a database at that location, holding
+       {{ preview.destination_jobs }} job{{ '' if preview.destination_jobs == 1 else 's' }},
+       and this computer&rsquo;s keys open it. You will <strong>switch to it</strong>.
        Nothing is copied.</p>
-    <p class="hint">Checked: {{ preview.detail }}.</p>
+    <p class="mono">{{ preview.destination }}</p>
+    <form action="/settings" method="post">
+      <input type="hidden" name="action" value="switch-confirm">
+      <input type="hidden" name="path" value="{{ typed }}">
+      <button type="submit">Switch to it</button>
+    </form>
+
+  {% elif preview.action == 'start' %}
+    <p>Nothing exists at that location, and there is nothing to move &mdash; you have no
+       saved work yet. New work will be saved there instead.</p>
+    <p class="mono">{{ preview.destination }}</p>
+    <form action="/settings" method="post">
+      <input type="hidden" name="action" value="start-confirm">
+      <input type="hidden" name="path" value="{{ typed }}">
+      <button type="submit">Save my work there</button>
+    </form>
+
+  {% else %}
+    <div class="callout warn">
+      <p><strong>There is already a database there, and it is not the one you are using.</strong>
+         Both hold work, so this one needs deciding.</p>
+    </div>
+    <table>
+      <tr><th></th><th>Location</th><th>Holds</th></tr>
+      <tr><th>Using now</th><td class="mono">{{ preview.source }}</td>
+          <td>{{ preview.source_jobs }} job{{ '' if preview.source_jobs == 1 else 's' }}</td></tr>
+      <tr><th>Already there</th><td class="mono">{{ preview.destination }}</td>
+          <td>{{ preview.destination_jobs }} job{{ '' if preview.destination_jobs == 1 else 's' }}</td></tr>
+    </table>
+    <p class="hint">Neither is deleted either way. Switching leaves your current database
+       exactly where it is, and you can come back to it from this page.</p>
+    <form action="/settings" method="post">
+      <input type="hidden" name="action" value="switch-confirm">
+      <input type="hidden" name="path" value="{{ typed }}">
+      <button type="submit">Switch to the one already there</button>
+    </form>
   {% endif %}
 
-  <form action="/settings" method="post">
-    <input type="hidden" name="action" value="{{ preview.action }}-confirm">
-    <input type="hidden" name="path" value="{{ typed }}">
-    <button type="submit">
-      {{ 'Move the vault' if preview.action == 'move' else 'Use this vault' }}
-    </button>
-  </form>
   <p class="hint"><a href="/settings">Cancel</a></p>
 </div>
 {% else %}
 <form class="panel" action="/settings" method="post">
-  <h2>Point somewhere else</h2>
-  <label for="path">Full path to a vault file</label>
+  <h2>Save somewhere else</h2>
+  <label for="path">Location of the database file</label>
   <input id="path" type="text" name="path" value="{{ typed }}" required
          placeholder="D:\firm-data\vault.db" spellcheck="false">
-  <p class="hint">The whole path including the file name. A network drive works, with
-     caveats you will be shown before anything changes.</p>
+  <p><button type="submit" formaction="/settings/browse" formnovalidate>Browse&hellip;</button></p>
+  <p class="hint">Browse opens a normal file window on this computer. A network drive
+     works, with a caution you will be shown first.</p>
 
-  <p><button type="submit" name="action" value="move">Move the vault here</button>
-     <button type="submit" name="action" value="use">Use a vault already here</button></p>
-
-  <p class="hint"><strong>Move</strong> copies the current vault to that file and keeps the
-     original. <strong>Use</strong> switches to a vault that is already there and copies
-     nothing. Each refuses the other&rsquo;s situation, so neither can quietly do the
-     wrong one.</p>
+  <p><button type="submit" name="action" value="choose">Use this location</button></p>
+  <p class="hint">You will be told exactly what will happen &mdash; whether your data gets
+     copied there, or there is already a database to switch to &mdash; and can stop before
+     anything changes.</p>
 </form>
 
 {% if vault and vault.chosen %}
 <form action="/settings" method="post">
   <input type="hidden" name="action" value="forget">
-  <button type="submit">Forget this choice and use the default</button>
+  <button type="submit">Go back to the default location</button>
 </form>
 {% endif %}
 {% endif %}

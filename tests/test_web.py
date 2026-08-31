@@ -1,6 +1,7 @@
 """Web layer: the full upload -> zip -> restore path a user actually takes."""
 
 import io
+import time
 import zipfile
 
 import pymupdf
@@ -11,6 +12,8 @@ from core import keys, paths, relocate, vault
 from core.crypto import LOOKUP_SECRET_ENV
 from core.keys import MASTER_KEY_ENV, generate_data_key, wrap
 from core.verify import extract_all_text
+from web import app as app_module
+from web import picker
 from tests.test_pipeline import K1_VALUES, NAMES_KEPT
 
 
@@ -86,6 +89,24 @@ def test_download_link_is_single_use(client, k1_bytes):
     scrub = client.post("/scrub", files=[_upload("k1.pdf", k1_bytes)])
     token = _download_token(scrub.text)
     assert client.get(f"/download/{token}").status_code == 200
+    assert client.get(f"/download/{token}").status_code == 404
+
+
+def test_download_link_expires_on_its_own(client, k1_bytes, monkeypatch):
+    """The README promises "single-use with a 15-minute expiry" and only the
+    first half was true.
+
+    Stale entries were swept when a *new* archive was stashed and nowhere else,
+    so on a quiet server -- which is every server outside business hours -- a
+    link kept working indefinitely. Nothing in the app noticed, because the
+    single-use pop happens whether or not the entry has aged out.
+    """
+    scrub = client.post("/scrub", files=[_upload("k1.pdf", k1_bytes)])
+    token = _download_token(scrub.text)
+
+    later = time.time() + app_module.DOWNLOAD_TTL_SECONDS + 1
+    monkeypatch.setattr(app_module.time, "time", lambda: later)
+
     assert client.get(f"/download/{token}").status_code == 404
 
 
@@ -296,8 +317,13 @@ def test_a_client_that_sends_no_policy_still_gets_the_default(client, k1_bytes):
 
 
 class TestCrossSiteRequests:
-    """The app has no authentication, so the origin is the only thing
-    distinguishing the user's own form from another site's."""
+    """Layered now, rather than the only thing standing here.
+
+    On a hosted install the SameSite=Lax session cookie is the primary defence:
+    a cross-site POST arrives without it and is bounced as unauthenticated. This
+    check remains for the local install, which has no session at all, and as a
+    second layer on the hosted one.
+    """
 
     def test_a_foreign_origin_is_refused(self, client, k1_bytes):
         response = client.post(
@@ -357,7 +383,9 @@ def settings_client(tmp_path, monkeypatch):
 
     from web import app as app_module
 
-    return TestClient(app_module.app), home, tmp_path
+    # client= so the loopback gate on the file picker sees a real address;
+    # TestClient otherwise reports "testclient" and every browse is a 403.
+    return TestClient(app_module.app, client=("127.0.0.1", 51234)), home, tmp_path
 
 
 def _make_vault(db_path, filename="Smith_John_K1.pdf"):
@@ -379,7 +407,7 @@ class TestSettingsPage:
         body = client.get("/settings").text
 
         assert str(home / paths.DB_FILENAME) in body
-        assert "key file does not move with the vault" in body
+        assert "keys stay on this computer" in body
         assert str(paths.env_file_path()) in body
 
     def test_a_preview_changes_nothing(self, settings_client):
@@ -388,10 +416,10 @@ class TestSettingsPage:
         destination = tmp_path / "elsewhere" / "firm.db"
 
         body = client.post(
-            "/settings", data={"action": "move", "path": str(destination)}
+            "/settings", data={"action": "choose", "path": str(destination)}
         ).text
 
-        assert "Confirm" in body
+        assert "Before anything changes" in body
         assert not destination.exists()
         assert paths.configured_db_path() is None
 
@@ -409,7 +437,7 @@ class TestSettingsPage:
         assert job_id in client.get("/jobs").text
 
         response = client.post(
-            "/settings", data={"action": "move-confirm", "path": str(destination)}
+            "/settings", data={"action": "copy-confirm", "path": str(destination)}
         )
 
         assert response.status_code == 200
@@ -425,7 +453,7 @@ class TestSettingsPage:
         _make_vault(home / paths.DB_FILENAME)
 
         response = client.post(
-            "/settings", data={"action": "move", "path": str(tmp_path)}
+            "/settings", data={"action": "choose", "path": str(tmp_path)}
         )
 
         assert response.status_code == 400
@@ -440,7 +468,7 @@ class TestSettingsPage:
         _make_vault(home / paths.DB_FILENAME)
 
         response = client.post(
-            "/settings", data={"action": "move", "path": "data/vault.db"}
+            "/settings", data={"action": "choose", "path": "data/vault.db"}
         )
 
         assert response.status_code == 400
@@ -459,22 +487,66 @@ class TestSettingsPage:
         monkeypatch.setenv(MASTER_KEY_ENV, __import__("base64").b64encode(b"z" * 32).decode())
         keys.clear_cache()
 
-        response = client.post("/settings", data={"action": "use", "path": str(foreign)})
+        response = client.post("/settings", data={"action": "choose", "path": str(foreign)})
 
         assert response.status_code == 400
-        assert "cli.py backup" in response.text
+        assert "do not decrypt it" in response.text
         assert paths.configured_db_path() is None
 
-    def test_adopting_an_empty_vault_points_at_the_other_action(self, settings_client):
+    def test_an_empty_database_with_nothing_to_move_just_starts_there(self, settings_client):
+        """Previously this was a refusal telling the user to pick the other
+        action. There is nothing ambiguous about it: both ends are empty, so
+        there is nothing to lose and nothing to choose between."""
         client, home, tmp_path = settings_client
         empty = tmp_path / "shared" / "vault.db"
         empty.parent.mkdir(parents=True)
         vault.connect(empty).close()
 
-        response = client.post("/settings", data={"action": "use", "path": str(empty)})
+        response = client.post("/settings", data={"action": "choose", "path": str(empty)})
 
-        assert response.status_code == 400
-        assert "Use Move" in response.text
+        assert response.status_code == 200
+        assert "nothing to move" in response.text
+        assert "Save my work there" in response.text
+
+    def test_an_empty_destination_copies_rather_than_asking(self, settings_client, tmp_path):
+        """The common case, and the one that used to need the right verb."""
+        client, home, _ = settings_client
+        _make_vault(home / paths.DB_FILENAME)
+
+        body = client.post(
+            "/settings",
+            data={"action": "choose", "path": str(tmp_path / "elsewhere" / "firm.db")},
+        ).text
+
+        assert "will be" in body and "copied" in body
+        assert "Copy it there" in body
+
+    def test_a_populated_destination_offers_to_switch(self, settings_client, tmp_path):
+        client, home, _ = settings_client
+        existing = tmp_path / "shared" / "vault.db"
+        _make_vault(existing)
+
+        body = client.post(
+            "/settings", data={"action": "choose", "path": str(existing)}
+        ).text
+
+        assert "already a database at that location" in body
+        assert "Switch to it" in body
+
+    def test_two_populated_databases_is_the_one_case_that_asks(self, settings_client, tmp_path):
+        """The only genuinely ambiguous situation, and it is asked with real
+        numbers rather than by making someone pick a verb up front."""
+        client, home, _ = settings_client
+        _make_vault(home / paths.DB_FILENAME)
+        other = tmp_path / "shared" / "vault.db"
+        _make_vault(other)
+        _make_vault(other, filename="Second.pdf")
+
+        body = client.post("/settings", data={"action": "choose", "path": str(other)}).text
+
+        assert "needs deciding" in body
+        assert "Using now" in body and "Already there" in body
+        assert "Switch to the one already there" in body
 
     def test_forget_clears_a_dangling_setting(self, settings_client):
         """The repair path: the drive is gone and the app will not start."""
@@ -497,7 +569,7 @@ class TestSettingsPage:
         body = client.get("/settings").text
 
         assert "cannot be read" in body
-        assert "Clear the setting" in body
+        assert "Clear the saved location" in body
 
     def test_a_foreign_origin_cannot_repoint_the_vault(self, settings_client, tmp_path):
         client, home, _ = settings_client
@@ -505,9 +577,89 @@ class TestSettingsPage:
 
         response = client.post(
             "/settings",
-            data={"action": "move-confirm", "path": str(tmp_path / "evil" / "v.db")},
+            data={"action": "copy-confirm", "path": str(tmp_path / "evil" / "v.db")},
             headers={"origin": "http://evil.example"},
         )
 
         assert response.status_code == 403
         assert paths.configured_db_path() is None
+
+
+class TestFilePicker:
+    """Browsing opens a dialog in the server process, which is sound only
+    because the server is the machine the browser is on."""
+
+    def test_the_chosen_path_lands_in_the_form(self, settings_client, monkeypatch, tmp_path):
+        client, home, _ = settings_client
+        chosen = tmp_path / "picked" / "firm.db"
+        monkeypatch.setattr(picker, "choose_database_path", lambda *a, **k: str(chosen))
+
+        body = client.post("/settings/browse", data={"path": ""}).text
+
+        assert str(chosen) in body
+
+    def test_browsing_changes_nothing_on_its_own(self, settings_client, monkeypatch, tmp_path):
+        """It only fills the box; Move and Use still have to be pressed. A
+        picker that also acted would be a one-click way to repoint the
+        database with no confirmation."""
+        client, home, _ = settings_client
+        _make_vault(home / paths.DB_FILENAME)
+        chosen = tmp_path / "picked" / "firm.db"
+        monkeypatch.setattr(picker, "choose_database_path", lambda *a, **k: str(chosen))
+
+        client.post("/settings/browse", data={"path": ""})
+
+        assert paths.configured_db_path() is None
+        assert not chosen.exists()
+
+    def test_cancelling_keeps_what_was_already_typed(self, settings_client, monkeypatch):
+        client, home, _ = settings_client
+        monkeypatch.setattr(picker, "choose_database_path", lambda *a, **k: None)
+
+        body = client.post("/settings/browse", data={"path": "D:\\typed\\vault.db"}).text
+
+        assert "D:\\typed\\vault.db" in body
+
+    def test_no_desktop_falls_back_to_typing_rather_than_failing(
+        self, settings_client, monkeypatch
+    ):
+        """tkinter is absent on some Linux builds and there is no desktop under
+        a service account. The page has to stay usable, since typing a path
+        was the only option before this existed."""
+        def unavailable(*args, **kwargs):
+            raise picker.DialogUnavailable("this Python has no tkinter")
+
+        client, home, _ = settings_client
+        monkeypatch.setattr(picker, "choose_database_path", unavailable)
+
+        response = client.post("/settings/browse", data={"path": ""})
+
+        assert response.status_code == 200
+        assert "Type the path instead" in response.text
+
+    def test_a_remote_client_cannot_open_a_dialog(self, settings_client, monkeypatch):
+        """On a shared host this would draw a modal on the server's desktop and
+        block a worker thread until someone dismissed it in person."""
+        client, home, _ = settings_client
+        called = False
+
+        def record(*args, **kwargs):
+            nonlocal called
+            called = True
+            return None
+
+        monkeypatch.setattr(picker, "choose_database_path", record)
+        remote = TestClient(client.app, client=("10.0.0.7", 4444))
+
+        assert remote.post("/settings/browse", data={"path": ""}).status_code == 403
+        assert not called
+
+    def test_a_foreign_origin_cannot_open_a_dialog(self, settings_client, monkeypatch):
+        client, home, _ = settings_client
+        monkeypatch.setattr(picker, "choose_database_path", lambda *a, **k: "C:\\x\\v.db")
+
+        response = client.post(
+            "/settings/browse", data={"path": ""}, headers={"origin": "http://evil.example"}
+        )
+
+        assert response.status_code == 403
