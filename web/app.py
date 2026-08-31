@@ -14,6 +14,7 @@ import io
 import secrets
 import time
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request, UploadFile
@@ -77,7 +78,20 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 # a third party at page load is the wrong trade.
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
-_downloads: dict[str, tuple[float, str, bytes]] = {}
+@dataclass(frozen=True, slots=True)
+class Pending:
+    """An archive waiting to be collected.
+
+    A record rather than a tuple because the fields are read in three places and
+    a positional unpack is how the wrong one gets read when a field is added.
+    """
+
+    created: float
+    filename: str
+    payload: bytes
+
+
+_downloads: dict[str, Pending] = {}
 
 
 def same_origin(request: Request) -> None:
@@ -113,16 +127,26 @@ def _db():
     return vault.connect(path)
 
 
+def _sweep(now: float) -> None:
+    """Drop everything past its expiry.
+
+    Called on read as well as on write. Sweeping only on write meant the expiry
+    was enforced by the *next* user to scrub something: on a quiet server a link
+    stayed live indefinitely, while the README promised fifteen minutes.
+    """
+    for key in [k for k, entry in _downloads.items() if now - entry.created > DOWNLOAD_TTL_SECONDS]:
+        del _downloads[key]
+
+
 def _stash(filename: str, payload: bytes) -> str:
     """Hold an archive for download and evict anything stale."""
     now = time.time()
-    for key in [k for k, (t, _, _) in _downloads.items() if now - t > DOWNLOAD_TTL_SECONDS]:
-        del _downloads[key]
+    _sweep(now)
     while len(_downloads) >= MAX_PENDING_DOWNLOADS:
-        del _downloads[min(_downloads, key=lambda k: _downloads[k][0])]
+        del _downloads[min(_downloads, key=lambda k: _downloads[k].created)]
 
     token = secrets.token_urlsafe(16)
-    _downloads[token] = (now, filename, payload)
+    _downloads[token] = Pending(created=now, filename=filename, payload=payload)
     return token
 
 
@@ -465,14 +489,21 @@ async def restore(request: Request, files: list[UploadFile] = None):
 
 @app.get("/download/{token}")
 def download(token: str):
-    entry = _downloads.pop(token, None)
+    """Hand over an archive once.
+
+    The pop happens only after the entry has been accepted. Popping first would
+    let anyone holding a guessed token destroy a download they cannot read.
+    """
+    _sweep(time.time())
+    entry = _downloads.get(token)
     if entry is None:
         raise HTTPException(status_code=404, detail="This download has expired.")
-    _, filename, payload = entry
+
+    del _downloads[token]
     return Response(
-        content=payload,
+        content=entry.payload,
         media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={"Content-Disposition": f'attachment; filename="{entry.filename}"'},
     )
 
 
