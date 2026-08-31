@@ -42,6 +42,19 @@ def read(path: Path) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise ConfigError(f"{path} does not contain a JSON object")
 
+    # Written since the first release and until now never read. A file from a
+    # newer install may carry a key whose meaning has changed, and this module
+    # refuses what it cannot trust rather than acting on half of it.
+    version = raw.get("version")
+    if version is not None:
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise ConfigError(f"{path}: version must be an integer, got {version!r}")
+        if version > CONFIG_VERSION:
+            raise ConfigError(
+                f"{path}: written by a newer version of this tool "
+                f"(file says {version}, this understands {CONFIG_VERSION})"
+            )
+
     stored = raw.get(VAULT_DB_KEY)
     if stored is not None:
         if not isinstance(stored, str) or not stored.strip():
